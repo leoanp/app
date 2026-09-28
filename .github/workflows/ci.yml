@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,9 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       # `+1.88` overrides rust-toolchain.toml, which asks for stable.
       - run: cargo +1.88 check --workspace --all-targets
-  # Kernel-dependent tests (Landlock ABI 6, fs-verity, composefs) will run
-  # under virtme-ng in a later job; see tests/vm/.
+  # The sandbox escape tests need root and Linux 6.12+ (GitHub's runners are
+  # older), so they are ignored here and run by tests/vm/sandbox-tests.sh.
+  # A virtme-ng job will run them in CI later.

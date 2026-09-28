@@ -1,0 +1,15 @@
+[package]
+name = "sandbox-tests"
+description = "Sandbox escape tests: a probe program tries to break out, and must fail."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+app-sandbox.workspace = true
+libc = "0.2.189"
+
+[lints]
+workspace = true
