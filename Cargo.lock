@@ -17,6 +17,7 @@ name = "app-composefs"
 version = "0.1.0"
 dependencies = [
  "app-objects",
+ "rustix",
  "tempfile",
  "thiserror",
 ]

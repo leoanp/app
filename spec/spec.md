@@ -165,9 +165,9 @@ RetroArch.app
 **Storage on the device**
 
 1. The installer verifies the bundle against its store's signed metadata (section 11), or asks the user to confirm a sideloaded bundle.
-2. It copies each file into the platform's shared object store, named by the hash of its contents. A file that is already present, from any app, is not stored again.
+2. It copies each file into the platform's shared object store, named by its fs-verity SHA-256 digest (4 KiB blocks, no salt): the same digest the kernel checks on every read. A file that is already present, from any app, is not stored again.
 3. It enables fs-verity on every stored object.
-4. It obtains the app's composefs image, which describes the app's file tree and points to the stored objects. Stores publish a prebuilt image with its digest in their signed metadata, and the installer checks it matches. For sideloaded bundles, the installer generates the image itself. Images are reproducible: the same files and composefs format version always give the same image.
+4. It obtains the app's composefs image, which describes the app's file tree and points to the stored objects. Stores publish a prebuilt image with its fs-verity SHA-256 digest (4 KiB blocks, no salt) in their signed metadata, and the installer checks it matches. For sideloaded bundles, the installer generates the image itself. Images are reproducible: the same files and composefs format version always give the same image.
 5. The runtime mounts the app read-only through composefs with verification required. The kernel checks every file against its digest on every read; a changed byte produces a read error.
 6. The original `.app` file is not kept. Objects no app refers to any more are deleted after an update or uninstall.
 
@@ -345,7 +345,7 @@ Every app runs under all of the layers below at once; each one covers gaps in th
 
 - Empty, private tmpfs folders cover `/run`, `/tmp`, `/var/tmp` and `/dev/shm`. World-writable sockets such as the system D-Bus, X11, CUPS and Avahi live there, so they are out of reach on every kernel. Nothing the app needs lives there: its connections are handed in, as file descriptors or as the individual sockets placed read-only into its private `/run`.
 - For granted game controllers, `/run/udev/data` stays visible, read-only.
-- `/proc` is a fresh instance mounted with `hidepid=invisible,subset=pid`: the app sees only its own processes, and none of the system-wide files.
+- `/proc` is a fresh instance mounted with `hidepid=invisible`: the app sees only its own processes, plus the system-wide files many runtimes read (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`). Landlock grants it read-only.
 - Mounts made outside after launch, such as a newly inserted USB drive, still appear inside; nothing mounted inside leaks out. The app cannot undo the private view: mounting and unmounting are blocked by seccomp.
 
 **seccomp rules.** Blocked system calls fail with an error the app can handle:
@@ -354,11 +354,12 @@ Every app runs under all of the layers below at once; each one covers gaps in th
 - loading kernel code (kernel modules, `kexec`, `bpf`);
 - kernel keyrings, performance monitoring (`perf_event_open`), rebooting, and changing the system time;
 - other administration no app needs: `syslog`, `acct`, `quotactl`, `swapon`, `swapoff`, `ioperm`, `iopl`, `uselib`, `vhangup`;
-- io_uring, because it can open network connections without the `socket` call; libraries fall back to ordinary calls.
+- io_uring, because it can open network connections without the `socket` call; libraries fall back to ordinary calls;
+- faking typed input into a terminal and console commands (the `ioctl` requests `TIOCSTI` and `TIOCLINUX`), as Flatpak blocks them.
 
 Sockets: an app may create local (Unix) sockets, and internet sockets (IPv4 and IPv6, TCP and UDP) only when `network` is granted. Netlink is limited to `NETLINK_ROUTE` (glibc's name lookups) and `NETLINK_KOBJECT_UEVENT` (device hotplug events for udev); every other netlink type and every other socket family, including raw packet sockets, is refused, even with `network`. It allows apps to create unprivileged user namespaces, because Chromium, Firefox and Electron build their own inner sandboxes with them; nothing created inside can escape the restrictions around it.
 
-**Launch hardening.** The launcher applies the layers in this order: cgroup, private view, the app's account and groups, no-new-privileges (so no program inside the app can gain rights), Landlock, seccomp. It then starts the app with only the environment and file descriptors it hands in; nothing else the launcher had open reaches the app, since Landlock does not restrict files that are already open. Every layer is inherited by every process the app starts.
+**Launch hardening.** The app starts in a new session without a controlling terminal (`setsid`), so it cannot type into or signal through the terminal the launcher runs in. The launcher applies the layers in this order: cgroup, private view, the app's account and groups, no-new-privileges (so no program inside the app can gain rights), Landlock, seccomp. It then starts the app with only the environment and file descriptors it hands in; nothing else the launcher had open reaches the app, since Landlock does not restrict files that are already open. Every layer is inherited by every process the app starts.
 
 **Fail closed.** The runtime must refuse to start any app if a required protection is unavailable. Platforms need Linux with Landlock ABI 6 or newer (Linux 6.12), fs-verity, EROFS, composefs support, cgroup v2, seccomp, mount namespaces, the Wayland security context protocol in the compositor, and unprivileged user namespaces allowed for app accounts.
 
@@ -511,9 +512,9 @@ A store is a set of static files on any web host: bundles, stored files, and sig
 - **Snapshot** fixes which versions of the metadata belong together.
 - **Timestamp** is re-signed frequently and expires, so a device notices if an attacker keeps serving an old catalog to hold back a fix.
 
-**What the catalog lists** for each app: ID, name, summary, icon, categories, `ui.inputs`, and for each architecture the latest build with its version, requirements, permissions, download size, the hash of the `.app` file, the hash of every file it contains, and its prebuilt composefs image with that image's digest. For apps with external files, it lists each file's publisher address, size and hash instead of hosting it.
+**What the catalog lists** for each app: ID, name, summary, icon, categories, `ui.inputs`, and for each architecture the latest build with its version, requirements, permissions, download size, the SHA-256 hash of the `.app` file, the fs-verity SHA-256 digest (4 KiB blocks, no salt) of every file it contains, and its prebuilt composefs image with that image's fs-verity SHA-256 digest (4 KiB blocks, no salt). For apps with external files, it lists each file's publisher address, size and plain SHA-256 hash instead of hosting it; that hash describes the vendor's download itself.
 
-**Downloads.** A store publishes both the `.app` files and each contained file, addressed by its hash. A new install downloads only files the device does not already have; so does every update. The `.app` file itself is used for sideloading and archiving.
+**Downloads.** A store publishes both the `.app` files and each contained file, addressed by its fs-verity SHA-256 digest (4 KiB blocks, no salt), so a device can tell which files it already stores. A new install downloads only files the device does not already have; so does every update. The `.app` file itself is used for sideloading and archiving.
 
 **Revocation.** A store can mark a build or an app as revoked. Devices then refuse to start it and offer to remove it.
 

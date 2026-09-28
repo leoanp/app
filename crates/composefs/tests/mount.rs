@@ -269,3 +269,49 @@ fn changed_file_gives_read_error() {
     // Untouched files still read fine.
     assert_eq!(fs::read(mnt.join("share/odd name/f=1")).unwrap(), b"x");
 }
+
+#[test]
+#[ignore = "needs root and fs-verity; run tests/vm/storage-tests.sh"]
+fn symlinks_in_a_bundle_are_recorded_never_followed() {
+    assert!(is_root(), "{REASON}");
+    let env = Env::new();
+    let src = env.sample("src");
+    symlink("/etc/shadow", src.join("share/evil")).unwrap();
+    symlink("/etc", src.join("share/evil-dir")).unwrap();
+    let tree = Tree::import_dir(&env.store, &src).unwrap();
+    assert_eq!(
+        tree.entries[&b"share/evil"[..]],
+        Node::Symlink {
+            target: b"/etc/shadow".to_vec()
+        }
+    );
+    assert_eq!(
+        tree.entries[&b"share/evil-dir"[..]],
+        Node::Symlink {
+            target: b"/etc".to_vec()
+        }
+    );
+    assert!(
+        !tree
+            .entries
+            .keys()
+            .any(|k| k.starts_with(b"share/evil-dir/")),
+        "never walked into"
+    );
+    let shadow = app_objects::digest::compute(fs::File::open("/etc/shadow").unwrap()).unwrap();
+    assert!(
+        !tree.digests().any(|d| *d == shadow),
+        "/etc/shadow must not be imported"
+    );
+    assert!(!env.store.verify(&shadow).unwrap());
+}
+
+#[test]
+#[ignore = "needs root and fs-verity; run tests/vm/storage-tests.sh"]
+fn bundle_root_may_not_be_a_symlink() {
+    assert!(is_root(), "{REASON}");
+    let env = Env::new();
+    let link = env.path("link");
+    symlink("/etc", &link).unwrap();
+    assert!(Tree::import_dir(&env.store, &link).is_err());
+}

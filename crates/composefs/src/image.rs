@@ -1,13 +1,16 @@
 //! Building and mounting composefs images (Linux only).
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use app_objects::{Digest, Store};
+use rustix::fs::{Dir, FileType, Mode, OFlags, fstat, openat, readlinkat};
 
 use crate::{Node, Tree};
 
@@ -46,57 +49,82 @@ pub fn tool(name: &'static str) -> Result<PathBuf, Error> {
 }
 
 impl Tree {
-    /// Reads a folder as untrusted input and stores its files. Symlinks are
-    /// recorded, never followed; hard links become separate entries (the
-    /// store keeps one copy anyway); setuid, setgid and sticky bits are
-    /// dropped; device files, sockets and pipes are refused.
+    /// Reads a folder as untrusted input and stores its files. Every entry
+    /// is opened relative to its parent's handle without following
+    /// symlinks, and its type is checked on the opened handle, so an entry
+    /// swapped for a symlink during the import can never pull in a file
+    /// from outside (such as `/etc/shadow`). Symlinks are recorded, never
+    /// followed; hard links become separate entries (the store keeps one
+    /// copy anyway); setuid, setgid and sticky bits are dropped; device
+    /// files, sockets and pipes are refused without being opened.
     pub fn import_dir(store: &Store, dir: &Path) -> Result<Tree, Error> {
+        let fail = |p: &Path| {
+            let p = p.to_owned();
+            move |e: rustix::io::Errno| Error::Io {
+                context: p.display().to_string(),
+                source: e.into(),
+            }
+        };
+        let root = rustix::fs::open(
+            dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(fail(dir))?;
+        let root_mode = fstat(&root).map_err(fail(dir))?.st_mode & 0o777;
         let mut tree = Tree::new();
-        let root_mode = fs::symlink_metadata(dir).map_err(io_err(dir.display()))?;
-        if !root_mode.is_dir() {
-            return Err(Error::Io {
-                context: dir.display().to_string(),
-                source: io::Error::new(io::ErrorKind::InvalidInput, "not a folder"),
-            });
-        }
-        tree.entries.insert(
-            Vec::new(),
-            Node::Dir {
-                mode: root_mode.permissions().mode() & 0o777,
-            },
-        );
-        let mut stack = vec![(dir.to_path_buf(), Vec::new())];
-        while let Some((abs, rel)) = stack.pop() {
-            for entry in fs::read_dir(&abs).map_err(io_err(abs.display()))? {
-                let entry = entry.map_err(io_err(abs.display()))?;
-                let path = entry.path();
+        tree.entries
+            .insert(Vec::new(), Node::Dir { mode: root_mode });
+
+        let mut stack: Vec<(OwnedFd, Vec<u8>)> = vec![(root, Vec::new())];
+        while let Some((dir_fd, rel)) = stack.pop() {
+            let shown = dir.join(OsStr::from_bytes(&rel));
+            for entry in Dir::read_from(&dir_fd).map_err(fail(&shown))? {
+                let entry = entry.map_err(fail(&shown))?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                let name_path = Path::new(OsStr::from_bytes(name));
                 let mut key = rel.clone();
                 if !key.is_empty() {
                     key.push(b'/');
                 }
-                key.extend_from_slice(entry.file_name().as_bytes());
-                let meta = fs::symlink_metadata(&path).map_err(io_err(path.display()))?;
-                let mode = meta.permissions().mode() & 0o777;
-                let ft = meta.file_type();
-                let node = if ft.is_dir() {
-                    stack.push((path.clone(), key.clone()));
-                    Node::Dir { mode }
-                } else if ft.is_symlink() {
-                    let target = fs::read_link(&path).map_err(io_err(path.display()))?;
-                    Node::Symlink {
-                        target: target.as_os_str().as_bytes().to_vec(),
+                key.extend_from_slice(name);
+                let path = dir.join(OsStr::from_bytes(&key));
+
+                let pinned = app_objects::pin(&dir_fd, name_path)?;
+                let st = fstat(&pinned).map_err(fail(&path))?;
+                let mode = st.st_mode & 0o777;
+                let node = match FileType::from_raw_mode(st.st_mode) {
+                    FileType::Directory => {
+                        let sub = openat(
+                            &pinned,
+                            ".",
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        )
+                        .map_err(fail(&path))?;
+                        stack.push((sub, key.clone()));
+                        Node::Dir { mode }
                     }
-                } else if ft.is_file() {
-                    let size = meta.len();
-                    let digest = if size == 0 {
-                        None
-                    } else {
-                        Some(store.import_file(&path)?)
-                    };
-                    Node::File { mode, size, digest }
-                } else {
+                    FileType::Symlink => {
+                        let target = readlinkat(&pinned, "", Vec::new()).map_err(fail(&path))?;
+                        Node::Symlink {
+                            target: target.into_bytes(),
+                        }
+                    }
+                    FileType::RegularFile => {
+                        let size = st.st_size as u64;
+                        let digest = if size == 0 {
+                            None
+                        } else {
+                            Some(store.import(app_objects::reopen_for_reading(&pinned, &path)?)?)
+                        };
+                        Node::File { mode, size, digest }
+                    }
                     // Device files, sockets, pipes.
-                    return Err(Error::SpecialFile(path));
+                    _ => return Err(Error::SpecialFile(path)),
                 };
                 tree.entries.insert(key, node);
             }

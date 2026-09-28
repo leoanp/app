@@ -21,9 +21,10 @@ use crate::{Bind, Error};
 /// Folders replaced by an empty, private tmpfs.
 pub const HIDDEN: &[&str] = &["/run", "/tmp", "/var/tmp", "/dev/shm"];
 
-/// Options of the app's `/proc`: other users' processes are invisible, and
-/// only process folders (plus `self`) exist.
-pub const PROC_OPTIONS: &std::ffi::CStr = c"hidepid=invisible,subset=pid";
+/// Options of the app's `/proc`: other users' processes are invisible. The
+/// system-wide files (`cpuinfo`, `meminfo`, `stat`) stay, since browsers,
+/// Electron, Java, .NET, SDL and FFmpeg read them.
+pub const PROC_OPTIONS: &std::ffi::CStr = c"hidepid=invisible";
 
 fn err(what: impl std::fmt::Display, e: impl std::fmt::Display) -> Error {
     Error::MountNamespace(format!("{what}: {e}"))

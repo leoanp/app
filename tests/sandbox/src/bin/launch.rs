@@ -1,6 +1,7 @@
 //! A minimal stand-in for the real launcher, for tests: builds a policy from
-//! its arguments, then calls `app_sandbox::exec`. Runs as a fresh,
-//! single-threaded process, as the real launcher's child does.
+//! its arguments, forks, and calls `app_sandbox::exec` in the child, as the
+//! real launcher will. Exits with the child's exit code (111 if sandboxing
+//! failed).
 //!
 //! ```text
 //! launch --uid N --gid N [--group N]... --cgroup PATH [--net]
@@ -118,6 +119,27 @@ mod linux {
             args: rest,
             env,
         };
-        app_sandbox::exec(&policy, &command).to_string()
+        // Like the real launcher: sandbox a forked child, never the launcher itself.
+        // SAFETY: this process is single-threaded, so the child may run any code.
+        match unsafe { libc::fork() } {
+            -1 => format!("fork: {}", std::io::Error::last_os_error()),
+            0 => {
+                let err = app_sandbox::exec(&policy, &command);
+                eprintln!("launch: {err}");
+                // SAFETY: ends the child without running the parent's cleanup.
+                unsafe { libc::_exit(111) }
+            }
+            child => {
+                let mut status = 0;
+                // SAFETY: waits for our own child; `status` is a valid pointer.
+                unsafe { libc::waitpid(child, &mut status, 0) };
+                let code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    128 + libc::WTERMSIG(status)
+                };
+                std::process::exit(code)
+            }
+        }
     }
 }

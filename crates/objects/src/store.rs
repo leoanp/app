@@ -12,6 +12,10 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+
+use rustix::fs::{CWD, FileType, Mode, OFlags, fstat, openat};
+
 use composefs_ioctls::fsverity::{EnableVerityError, fs_ioc_enable_verity, fs_ioc_measure_verity};
 
 use crate::digest::{self, BLOCK_SIZE, Digest};
@@ -26,6 +30,8 @@ pub enum Error {
     VerityUnsupported(PathBuf),
     #[error("fs-verity failed on {path}: {message}")]
     Verity { path: PathBuf, message: String },
+    #[error("`{0}` is not a regular file")]
+    NotRegular(PathBuf),
     #[error("stored data does not match: computed {computed}, kernel measured {measured}")]
     Mismatch { computed: Digest, measured: Digest },
 }
@@ -85,11 +91,11 @@ impl Store {
         }
     }
 
-    /// Copies a file into the store and returns its digest. A file already
-    /// stored (by any app) is not stored again.
+    /// Copies a regular file into the store and returns its digest. A file
+    /// already stored (by any app) is not stored again. `src` itself must
+    /// not be a symlink (see [`open_regular`]).
     pub fn import_file(&self, src: &Path) -> Result<Digest, Error> {
-        let f = File::open(src).map_err(io_err(src.display()))?;
-        self.import(f)
+        self.import(open_regular(CWD, src)?)
     }
 
     /// Stores everything `reader` yields and returns its digest.
@@ -188,6 +194,47 @@ impl Store {
         }
         Ok(removed)
     }
+}
+
+/// Opens `name` (relative to `dir`) for reading only if it is a regular
+/// file, without following a symlink and without ever opening anything
+/// else: the entry is first pinned with `O_PATH | O_NOFOLLOW`, its type is
+/// checked on that handle, and only then is exactly that file reopened for
+/// reading. A file swapped for a symlink or a device while this runs can
+/// therefore never be read in its place.
+pub fn open_regular(dir: impl AsFd, name: &Path) -> Result<File, Error> {
+    let pinned = pin(dir, name)?;
+    let st = fstat(&pinned).map_err(|e| io_err(name.display())(e.into()))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(Error::NotRegular(name.to_owned()));
+    }
+    reopen_for_reading(&pinned, name)
+}
+
+/// Opens an entry as a bare handle (`O_PATH`), never following a final symlink.
+pub fn pin(dir: impl AsFd, name: &Path) -> Result<OwnedFd, Error> {
+    openat(
+        dir,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| io_err(name.display())(e.into()))
+}
+
+/// Opens exactly the file behind a pinned handle for reading.
+pub fn reopen_for_reading(pinned: &OwnedFd, name: &Path) -> Result<File, Error> {
+    let magic = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+    let fd = rustix::fs::open(&magic, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| io_err(name.display())(e.into()))?;
+    let (a, b) = (
+        fstat(pinned).map_err(|e| io_err(name.display())(e.into()))?,
+        fstat(&fd).map_err(|e| io_err(name.display())(e.into()))?,
+    );
+    if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino) {
+        return Err(Error::NotRegular(name.to_owned()));
+    }
+    Ok(File::from(fd))
 }
 
 /// Asks the kernel for a file's fs-verity digest.

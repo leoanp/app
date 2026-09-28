@@ -4,7 +4,8 @@
 //!
 //! 1. cgroup: the process joins the app's cgroup;
 //! 2. private mount namespace: empty tmpfs over `/run`, `/tmp`, `/var/tmp`
-//!    and `/dev/shm`, a `/proc` showing only the app's own processes, and
+//!    and `/dev/shm`, a `/proc` showing only the app's own processes
+//!    (always granted read-only), and
 //!    any read-only [`Bind`]s the launcher asks for;
 //! 3. identity: supplementary groups, group ID, user ID (all three of real,
 //!    effective and saved), after which the process holds no capabilities;
@@ -12,7 +13,8 @@
 //! 5. Landlock: files, devices, network ports, signals, abstract sockets;
 //! 6. seccomp: blocked system calls and socket types.
 //!
-//! Everything fails closed: if any step cannot be applied, [`exec`] returns
+//! First, the process starts a new session (`setsid`), so it has no
+//! controlling terminal. Everything fails closed: if any step cannot be applied, [`exec`] returns
 //! an error and nothing is executed. Before the first step, every open file
 //! descriptor except those listed in [`Policy::keep_fds`] is marked
 //! close-on-exec, and the environment is replaced entirely.
@@ -38,7 +40,7 @@ use std::path::{Component, PathBuf};
 
 pub use kernel::{KernelInfo, MIN_LANDLOCK_ABI, check_kernel};
 pub use mount_ns::{HIDDEN, PROC_OPTIONS};
-pub use seccomp::{BLOCKED_SYSCALLS, NETLINK_ALLOWED};
+pub use seccomp::{BLOCKED_IOCTLS, BLOCKED_SYSCALLS, NETLINK_ALLOWED};
 
 /// What an app may do. Built by the launcher from the manifest, the
 /// registry and the user's permission choices.
@@ -114,6 +116,8 @@ pub enum Error {
     Policy(String),
     #[error("this system lacks a required protection: {0}")]
     Kernel(String),
+    #[error("could not start a new session: {0}")]
+    Session(String),
     #[error("could not join the app's cgroup: {0}")]
     Cgroup(String),
     #[error("could not set up the app's private view of the filesystem: {0}")]
@@ -148,6 +152,10 @@ pub fn apply(policy: &Policy) -> Result<(), Error> {
     validate(policy)?;
     let info = check_kernel()?;
     let filter = seccomp::prepare(policy.network)?;
+
+    // A new session without a controlling terminal: the app can never
+    // type into, or signal through, the terminal the launcher runs in.
+    rustix::process::setsid().map_err(|e| Error::Session(e.to_string()))?;
 
     cgroup::join(&policy.cgroup)?;
     mount_ns::enter(&policy.binds)?;

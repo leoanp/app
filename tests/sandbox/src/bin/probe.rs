@@ -147,6 +147,21 @@ mod linux {
                 // SAFETY: valid C string; expected to be refused.
                 check(unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } as _)
             }
+            "tiocsti" => {
+                let c: libc::c_char = b'x' as _;
+                // SAFETY: TIOCSTI reads one byte from a valid pointer.
+                check(unsafe { libc::ioctl(0, libc::TIOCSTI, &c) } as _)
+            }
+            "userns-map" => {
+                // What browsers do for their inner sandbox: a user namespace,
+                // then their own ID mapping written to /proc/self/uid_map.
+                // SAFETY: plain integer arguments.
+                let uid = unsafe { libc::getuid() };
+                // SAFETY: unshare takes only flags.
+                check(unsafe { libc::unshare(libc::CLONE_NEWUSER) } as _)
+                    .and_then(|()| std::fs::write("/proc/self/setgroups", "deny"))
+                    .and_then(|()| std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")))
+            }
             "keyctl" => sys(libc::SYS_keyctl, [0, 0, 0, 0]),
             "bpf" => sys(libc::SYS_bpf, [0, 0, 0, 0]),
             "perf" => sys(libc::SYS_perf_event_open, [0, 0, -1, -1]),

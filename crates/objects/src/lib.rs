@@ -10,7 +10,7 @@ pub mod store;
 
 pub use digest::Digest;
 #[cfg(target_os = "linux")]
-pub use store::{Error, Store, seal};
+pub use store::{Error, Store, open_regular, pin, reopen_for_reading, seal};
 
 #[cfg(all(test, target_os = "linux"))]
 mod store_tests;

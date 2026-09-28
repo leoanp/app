@@ -104,7 +104,10 @@ fn excluded(props: &Props) -> bool {
     props.is("ID_INPUT_KEYBOARD") || props.is("ID_INPUT_TOUCHSCREEN") || props.is("ID_INPUT_TABLET")
 }
 
-/// The controller's folder: the part of its `/sys` path before `/input/input<N>`.
+/// The controller's folder: the part of its `/sys` path before
+/// `/input/input<N>`. Virtual devices (uinput, as remapping tools and Steam
+/// Input create) all share `/sys/devices/virtual/input`, so for them the
+/// `input<N>` folder itself is the controller's folder.
 fn physical_dir(sys: &Path) -> Option<PathBuf> {
     let mut dir = sys;
     while let Some(parent) = dir.parent() {
@@ -114,7 +117,11 @@ fn physical_dir(sys: &Path) -> Option<PathBuf> {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("input"))
         {
-            return parent.parent().map(Path::to_owned);
+            let above = parent.parent()?;
+            if above.ends_with("devices/virtual") {
+                return Some(dir.to_owned());
+            }
+            return Some(above.to_owned());
         }
         dir = parent;
     }
@@ -312,6 +319,51 @@ mod tests {
         let g = discover(t.path()).unwrap();
         assert_eq!(g.nodes.len(), 1);
         assert!(g.sysfs[0].ends_with("sys/devices/platform/joypad"));
+    }
+
+    #[test]
+    fn virtual_gamepad_alone_is_granted() {
+        // uinput devices from remapping tools: a gamepad, a mouse and a
+        // keyboard, all under /sys/devices/virtual/input.
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        let v = "sys/devices/virtual/input";
+        node(
+            r,
+            &format!("{v}/input9/event9"),
+            "input/event9",
+            (13, 73),
+            &["ID_INPUT=1", "ID_INPUT_JOYSTICK=1"],
+        );
+        node(
+            r,
+            &format!("{v}/input9/js1"),
+            "input/js1",
+            (13, 1),
+            &["ID_INPUT=1", "ID_INPUT_JOYSTICK=1"],
+        );
+        node(
+            r,
+            &format!("{v}/input10/event10"),
+            "input/event10",
+            (13, 74),
+            &["ID_INPUT=1", "ID_INPUT_MOUSE=1"],
+        );
+        node(
+            r,
+            &format!("{v}/input11/event11"),
+            "input/event11",
+            (13, 75),
+            &["ID_INPUT=1", "ID_INPUT_KEYBOARD=1"],
+        );
+        let root = fs::canonicalize(r).unwrap();
+        let g = discover(r).unwrap();
+        assert_eq!(
+            g.nodes,
+            vec![root.join("dev/input/event9"), root.join("dev/input/js1")]
+        );
+        assert_eq!(g.sysfs, vec![root.join(v).join("input9")]);
+        assert_eq!(g.udev_data.len(), 2);
     }
 
     #[test]

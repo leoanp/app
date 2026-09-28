@@ -102,7 +102,6 @@ impl World {
         for rule in [
             "read-exec:/usr".to_owned(),
             "read:/etc/ld.so.cache".to_owned(),
-            "read:/proc".to_owned(),
             "device:/dev/null".to_owned(),
             format!("read-exec:{}", self.app().display()),
             format!("read-write-exec:{}", self.data().display()),
@@ -115,7 +114,18 @@ impl World {
 
     /// Runs the probe with `attempts` under the base policy plus `extra`.
     fn run(&self, extra: &[&str], attempts: &[&str]) -> Outcome {
+        self.run_with(extra, attempts, |_| {})
+    }
+
+    /// Like [`World::run`], letting the test adjust the launcher's process first.
+    fn run_with(
+        &self,
+        extra: &[&str],
+        attempts: &[&str],
+        adjust: impl FnOnce(&mut Command),
+    ) -> Outcome {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_launch"));
+        adjust(&mut cmd);
         cmd.args(self.base_args())
             .args(extra)
             .arg("--")
@@ -486,22 +496,25 @@ fn system_bus_and_tmp_sockets_are_unreachable() {
 #[test]
 #[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
 fn proc_shows_only_its_own_processes() {
+    // No /proc rule is given: the sandbox grants its private /proc itself.
     let w = World::new("proc");
-    let o = w.run(
-        &[],
-        &[
-            "read:/proc/self/status",
-            "read:/proc/1/status",
-            "list:/proc/1",
-            "read:/proc/cpuinfo",
-            "read:/proc/sys/kernel/hostname",
-        ],
-    );
+    let attempts = [
+        "read:/proc/self/status",
+        "read:/proc/1/status",
+        "list:/proc/1",
+        "read:/proc/cpuinfo",
+        "read:/proc/meminfo",
+        "read:/proc/stat",
+        "write:/proc/self/comm",
+    ];
+    let o = w.run(&[], &attempts);
     o.expect("read:/proc/self/status", "ok");
     o.expect("read:/proc/1/status", ENOENT); // root's process: invisible
     o.expect("list:/proc/1", ENOENT);
-    o.expect("read:/proc/cpuinfo", ENOENT); // subset=pid: no system-wide files
-    o.expect("read:/proc/sys/kernel/hostname", ENOENT);
+    o.expect("read:/proc/cpuinfo", "ok");
+    o.expect("read:/proc/meminfo", "ok");
+    o.expect("read:/proc/stat", "ok");
+    o.expect("write:/proc/self/comm", EACCES); // read-only
 }
 
 #[test]
@@ -587,4 +600,73 @@ fn only_route_and_uevent_netlink() {
     o.expect("netlink:9", EPROTONOSUPPORT); // NETLINK_AUDIT
     o.expect("netlink:4", EPROTONOSUPPORT); // NETLINK_SOCK_DIAG
     o.expect("netlink:16", EPROTONOSUPPORT); // NETLINK_GENERIC
+}
+
+// ---- Terminal injection, placed sockets, browser sandboxes -----------------
+
+/// A new pseudo-terminal: (controlling side, terminal side).
+fn pty() -> (fs::File, fs::File) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: standard pty setup; every returned descriptor is checked and owned.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0);
+        assert_eq!(libc::grantpt(master), 0);
+        assert_eq!(libc::unlockpt(master), 0);
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(libc::ptsname_r(master, name.as_mut_ptr(), name.len()), 0);
+        let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(slave >= 0);
+        (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave))
+    }
+}
+
+/// The launcher runs in a terminal (its session's controlling terminal is
+/// on fd 0). The app must not be able to type commands into it.
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn cannot_type_into_the_launchers_terminal() {
+    let (_master, terminal) = pty();
+    let w = World::new("tiocsti");
+    let o = w.run_with(&[], &["tiocsti"], |cmd| {
+        cmd.stdin(terminal);
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+    o.expect("tiocsti", EPERM);
+}
+
+/// Sockets the launcher places into the private /run are reachable; any
+/// other socket, even one right beside it outside, is not.
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn placed_socket_reachable_unplaced_not() {
+    let dir = PathBuf::from(format!("/run/app-sbx-sockets-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("a.sock"), dir.join("b.sock"));
+    let _la = std::os::unix::net::UnixListener::bind(&a).unwrap();
+    let _lb = std::os::unix::net::UnixListener::bind(&b).unwrap();
+    for s in [&a, &b] {
+        fs::set_permissions(s, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let w = World::new("placed");
+    let bind = format!("{}:/run/app/a.sock", a.display());
+    let placed = "unix:/run/app/a.sock";
+    let unplaced = format!("unix:{}", b.display());
+    let original = format!("unix:{}", a.display());
+    let o = w.run(
+        &["--bind", &bind, "--rule", "connect:/run/app/a.sock"],
+        &[placed, &unplaced, &original],
+    );
+    let _ = fs::remove_dir_all(&dir);
+    o.expect(placed, "ok");
+    o.expect(&unplaced, ENOENT);
+    o.expect(&original, ENOENT);
 }

@@ -102,6 +102,15 @@ pub(crate) fn prepare(network: bool) -> Result<ScmpFilterContext, Error> {
             .map_err(err)?;
     }
 
+    // Terminal injection: faking typed input into a terminal (TIOCSTI) and
+    // the console's special commands (TIOCLINUX), as Flatpak blocks them.
+    let ioctl = syscall("ioctl")?;
+    for request in BLOCKED_IOCTLS {
+        let cmp = ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(0xffff_ffff), *request);
+        f.add_rule_conditional(ScmpAction::Errno(libc::EPERM), ioctl, &[cmp])
+            .map_err(err)?;
+    }
+
     // Socket families: compare only the low 32 bits, as the kernel does, so
     // garbage in the upper bits cannot slip past.
     let allowed = allowed_families(network);
@@ -135,6 +144,11 @@ pub(crate) fn prepare(network: bool) -> Result<ScmpFilterContext, Error> {
     }
     Ok(f)
 }
+
+/// `ioctl` requests no app may make: `TIOCSTI`, `TIOCLINUX`.
+// The constants' integer type differs between C libraries and architectures.
+#[allow(clippy::unnecessary_cast)]
+pub const BLOCKED_IOCTLS: &[u64] = &[libc::TIOCSTI as u64, libc::TIOCLINUX as u64];
 
 /// Netlink protocols an app may use.
 pub const NETLINK_ALLOWED: &[i32] = &[libc::NETLINK_ROUTE, libc::NETLINK_KOBJECT_UEVENT];

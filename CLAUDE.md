@@ -92,7 +92,7 @@ Mark all crates `publish = false` for now.
 Work in this order. Finish and test each step before starting the next.
 
 1. `spec/foundation.toml` + `crates/manifest` + `crates/foundation` (pure Rust, fully unit-tested, no system access).
-2. `crates/sandbox`: apply cgroup → private mount namespace (tmpfs over `/run`, `/tmp`, `/var/tmp`, `/dev/shm`; `/proc` with `hidepid=invisible,subset=pid`) → groups/gid/uid → `PR_SET_NO_NEW_PRIVS` → Landlock `restrict_self` → seccomp → `execve`, in that order. Test with a fixture binary. With `gamepad` granted, allow reading exactly what libudev-based gamepad discovery (SDL and others) needs under `/run/udev/data` and `/sys`, and nothing more.
+2. `crates/sandbox`: apply cgroup → private mount namespace (tmpfs over `/run`, `/tmp`, `/var/tmp`, `/dev/shm`; `/proc` with `hidepid=invisible`, granted read-only) → groups/gid/uid → `PR_SET_NO_NEW_PRIVS` → Landlock `restrict_self` → seccomp → `execve`, in that order. Test with a fixture binary. With `gamepad` granted, allow reading exactly what libudev-based gamepad discovery (SDL and others) needs under `/run/udev/data` and `/sys`, and nothing more.
 3. `crates/objects` + `crates/composefs`: import files by hash, enable fs-verity, build/verify the composefs image, mount with verity required.
 4. `crates/registry` + `bins/app-launcher`.
 5. `bins/app` with `install` and `run`. `install` must run `app_manifest::bundle::check` and refuse any bundle containing a foundation or driver-internal library (classify every ELF file by its `DT_SONAME`, falling back to the file name, with `app_foundation::Foundation::classify`). Sideloaded bundles never pass through the packager, so the installer is the only guard.
@@ -111,6 +111,8 @@ Work in this order. Finish and test each step before starting the next.
 
 **Open items**
 
+- Step 4: on systemd systems, create the app's cgroup through a systemd transient scope rather than directly under `/sys/fs/cgroup`.
+- Step 8: PipeWire needs its access-control module (the one Flatpak uses with portals), so apps connecting as their own account get playback only.
 - Step 8: game controllers plugged in after an app starts are not visible to it (Landlock rules cannot grow after launch). Likely design: the launcher or a small shared service passes new controller devices to the app as file descriptors, the way logind hands devices to compositors. Not decided yet.
 
 ## 5. Technology choices

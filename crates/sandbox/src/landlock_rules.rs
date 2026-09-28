@@ -73,6 +73,12 @@ pub(crate) fn prepare(policy: &Policy, info: &KernelInfo) -> Result<RulesetCreat
     }
     let mut created = ruleset.create().map_err(err)?;
 
+    // The private /proc the sandbox mounted: always readable, never writable.
+    let proc_fd = PathFd::new("/proc").map_err(err)?;
+    created = created
+        .add_rule(PathBeneath::new(proc_fd, rights(Access::Read)))
+        .map_err(err)?;
+
     for rule in &policy.paths {
         let mut access = rights(rule.access);
         if rule.access == Access::Connect {

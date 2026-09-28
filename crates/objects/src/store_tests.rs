@@ -125,3 +125,57 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[test]
+#[ignore = "needs a filesystem with fs-verity; run tests/vm/storage-tests.sh"]
+fn import_file_refuses_symlinks_and_special_files() {
+    let dir = test_dir();
+    let store = Store::open(dir.path().join("store")).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
+    assert!(
+        store.import_file(&link).is_err(),
+        "a symlink must not be followed"
+    );
+    let fifo = dir.path().join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Must return at once (a pipe opened for reading would block).
+    assert!(matches!(
+        store.import_file(&fifo),
+        Err(crate::Error::NotRegular(_))
+    ));
+    assert!(matches!(
+        store.import_file(dir.path()),
+        Err(crate::Error::NotRegular(_))
+    ));
+}
+
+/// The race the import guards against, made deterministic: the entry is
+/// checked, then swapped for a symlink to an outside file before reading.
+/// The pinned handle still reads the original file.
+#[test]
+#[ignore = "needs a filesystem with fs-verity; run tests/vm/storage-tests.sh"]
+fn swapped_entry_cannot_pull_in_an_outside_file() {
+    let dir = test_dir();
+    let store = Store::open(dir.path().join("store")).unwrap();
+    let name = std::path::Path::new("lib.so");
+    let path = dir.path().join(name);
+    fs::write(&path, b"the app's own file").unwrap();
+    let parent = fs::File::open(dir.path()).unwrap();
+
+    let pinned = crate::pin(&parent, name).unwrap();
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", &path).unwrap();
+
+    let file = crate::reopen_for_reading(&pinned, &path).unwrap();
+    let d = store.import(file).unwrap();
+    assert_eq!(fs::read(store.path(&d)).unwrap(), b"the app's own file");
+    // And a fresh attempt now refuses the symlink outright.
+    assert!(crate::open_regular(&parent, name).is_err());
+}
