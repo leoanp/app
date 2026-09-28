@@ -108,19 +108,20 @@ Popularity is never a reason. The foundation is what any modern, standard Linux 
 | libstdc++, libgcc_s | C++ runtime of platform drivers such as Mesa | `requires.libstdcxx` |
 | Vulkan loader, libglvnd (`libGL.so.1`, `libGLX.so.0`, `libOpenGL.so.0`, EGL, OpenGL ES), Mesa drivers, libdrm, libgbm | GPU drivers must match the hardware and kernel | `requires.vulkan`, `requires.gl`, `requires.gles` |
 | A fixed set of X11 client libraries GPU drivers are built against (libX11, libxcb and related; listed below) | Mesa's GLX driver, and its EGL driver when built with X11 support, are built against them; their interfaces have been stable for decades | not declared; always present |
+| Libraries every GPU driver is built against: zlib, zstd, expat, libudev, and libffi (used by the Wayland client library) | Drivers are loaded into apps; if a bundle carried its own copy, the driver would use it and could break | not declared; always present |
 | libva and its drivers | Hardware video decoding and encoding drivers | `requires.libva` |
 | Wayland client libraries, libxkbcommon | Talk to the platform's compositor | not declared; always present |
 | PipeWire client library, ALSA library routed to PipeWire | Talk to the platform's audio server | not declared; always present |
 
 **The X11 set** is fixed by this spec, so a bundle works the same on every platform: libX11, libX11-xcb, libxcb with its `glx`, `dri2`, `dri3`, `present`, `sync`, `xfixes`, `randr` and `shm` extensions, libXext, libXfixes, libXxf86vm, libxshmfence, libXau and libXdmcp. Every platform installs all of them, even if its own drivers use fewer. Platforms also build their OpenGL stack with GLX support (Mesa's GLX driver present), even on systems without an X11 desktop: the foundation promises `libGL.so.1` and `libGLX.so.0`, and X11 apps using OpenGL need a GLX driver behind them.
 
-**Driver-internal libraries** (Mesa's driver files, the GPU-specific libdrm helpers such as `libdrm_amdgpu`, libglvnd's vendor libraries, libva and Vulkan drivers) belong to the foundation too. Bundles never contain them, but which ones a platform installs depends on its hardware.
+**Driver-internal libraries** (Mesa's driver files, the GPU-specific libdrm helpers such as `libdrm_amdgpu`, libglvnd's vendor libraries, libva and Vulkan drivers, and GPU-specific libraries some drivers link, such as LLVM, SPIRV-Tools, libelf and libdisplay-info) belong to the foundation too. Bundles never contain them, but which ones a platform installs depends on its hardware.
 
 **The foundation list.** The exact library list of each format version is published with this spec as a machine-readable file, `foundation.toml`. Tools use it to decide what a bundle must not contain.
 
 **System data apps may read** (files, not libraries): installed fonts and font configuration, icon and cursor themes, trusted certificate authorities, time zone data, DNS and host name configuration, and locale settings.
 
-**Always bundled, never foundation:** everything else, including SDL2, zlib, fontconfig, FreeType, HarfBuzz, libudev, OpenSSL, FFmpeg, ICU, Qt, GTK, Python, X11 libraries not listed above (such as libXrandr, libXi, libXcursor) and Xwayland. composefs stores identical copies once, so bundling costs no extra disk space for files shared between apps. Wayland apps never load the foundation's X11 libraries; only apps that use GLX or X11 do.
+**Always bundled, never foundation:** everything else, including SDL2, fontconfig, FreeType, HarfBuzz, OpenSSL, FFmpeg, ICU, Qt, GTK, Python, X11 libraries not listed above (such as libXrandr, libXi, libXcursor) and Xwayland. composefs stores identical copies once, so bundling costs no extra disk space for files shared between apps. Wayland apps never load the foundation's X11 libraries; only apps that use GLX or X11 do.
 
 **Rules for platforms**
 
@@ -128,7 +129,8 @@ Popularity is never a reason. The foundation is what any modern, standard Linux 
 2. If a foundation library releases an incompatible new major version, the new one is added beside the old one; the old one stays.
 3. Each platform release carries its own foundation list, generated from its build: the spec's `foundation.toml` with any libraries the platform adds (it may add, never drop), plus a `[provides]` table giving the version of each requirement it meets, for example `glibc = "2.40"`. `glibc` and `libstdcxx` are always given; a graphics or video entry is left out on hardware without it, and apps requiring it do not run there. The list lives in the read-only system image, so after a rollback it describes the system that is actually running.
 4. The platform also publishes that same file for each release, for example alongside its release notes. Stores and tools use these published copies, since they cannot read a device. The store client on the device makes the final compatibility check with the local file.
-5. The runtime checks an app's `requires` against the local file at every launch, not only at install. After a system rollback, an app needing newer versions shows "Update your system to open this app" instead of starting.
+5. Platforms should build their GPU drivers so they link only foundation and driver-internal libraries: for example, LLVM without libxml2, liblzma, libedit or terminfo, and Mesa without libsensors. A platform whose drivers link more still conforms. This is a known, low-risk limitation: if an app bundles a library with the same file name, the driver uses the app's copy, which is meant to be compatible.
+6. The runtime checks an app's `requires` against the local file at every launch, not only at install. After a system rollback, an app needing newer versions shows "Update your system to open this app" instead of starting.
 
 **Processor architecture.** Each bundle is built for one architecture (`x86_64` or `aarch64`). The store serves the right file for each device. This keeps downloads small; one file per architecture is simpler than a combined file.
 
@@ -154,7 +156,7 @@ RetroArch.app
 
 1. `manifest.toml` and `icons/256.png` must be at the top level. `icons/256.png` must be a valid PNG of exactly 256×256 pixels; `icons/scalable.svg`, if present, is at most 1 MiB.
 2. Programs must find bundled libraries through a relative search path (`$ORIGIN/../lib`) and must not depend on an absolute install location.
-3. A bundle must not contain foundation libraries (section 4).
+3. A bundle must not contain foundation libraries (section 4). The installer refuses such bundles too, not only the packaging tools, because sideloaded bundles never pass through them.
 4. Special files are not allowed: the installer rejects device files and removes setuid and setgid flags.
 5. An app that needs X11 bundles its own Xwayland and a small X11-to-Wayland bridge (such as xwayland-satellite), started by its own `exec`. The runtime treats it like any other app; each X11 app gets a private X server inside its own sandbox, so X11 apps cannot see each other.
 6. Apps that were built to live at `/app` (converted from Flatpak) set `compat.prefix = "/app"`. The launcher then shows the app's files at `/app` inside that app's private view of the filesystem.
@@ -581,7 +583,7 @@ The format defines what every platform must do the same way; everything else is 
 | Provide a UnifiedPush distributor, if it pauses background apps (section 8) | Where apps, stored files and app data live on disk |
 | Follow the manifest, permission and store rules exactly | Where the shared folders map to |
 
-**Conformance.** The project publishes a conformance test suite: sample bundles and automated checks proving a platform installs, runs, isolates and updates apps as this spec requires. That includes sandbox tests confirming an app cannot read other apps' data, reach the network without permission, or reach the session bus. A platform may call itself `.app`-compatible only if it passes.
+**Conformance.** The project publishes a conformance test suite: sample bundles and automated checks proving a platform installs, runs, isolates and updates apps as this spec requires. That includes sandbox tests confirming an app cannot read other apps' data, reach the network without permission, or reach the session bus. A platform may call itself `.app`-compatible only if it passes. Recommendations ("should") are reported as warnings, not failures; for example, GPU drivers that link libraries outside the foundation (section 4).
 
 **Threat model.** The design protects the user and the system against apps that are buggy, compromised or malicious, and against tampered downloads and stores serving old or altered metadata. It does not protect against kernel or GPU driver flaws, a store the user chose to trust turning malicious, or an app misusing access the user granted (for example sending away files from a folder the user shared with it).
 

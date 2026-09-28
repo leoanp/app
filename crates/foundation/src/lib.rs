@@ -145,12 +145,19 @@ impl Foundation {
         Ok(())
     }
 
-    /// Classifies a library by its soname or file name, such as `libGL.so.1`.
+    /// Classifies a library by its soname (`libstdc++.so.6`) or file name.
+    /// A file name matches a soname exactly or as its fuller-versioned file
+    /// (`libstdc++.so.6.0.33`). The packager should prefer the ELF
+    /// `DT_SONAME`; the file name is the fallback.
     pub fn classify(&self, name: &str) -> Class<'_> {
+        let is_soname_file = |soname: &String| {
+            name.strip_prefix(soname.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        };
         if let Some(c) = self
             .components
             .iter()
-            .find(|c| c.sonames.iter().any(|s| s == name))
+            .find(|c| c.sonames.iter().any(is_soname_file))
         {
             return Class::Foundation(c);
         }

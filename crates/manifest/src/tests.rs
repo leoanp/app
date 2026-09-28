@@ -608,3 +608,26 @@ fn special_files_refused() {
     fs.special("dev/null");
     bundle_refused_on(&fs, &example(), "dev/null");
 }
+
+/// The installer runs as root on untrusted files: deep nesting must be
+/// refused, not crash (stack overflow). Every nesting form TOML has, each
+/// as deep as fits in 64 KiB. Tests run on 2 MiB thread stacks, smaller than
+/// a real process's main thread, so passing here leaves a margin.
+#[test]
+fn deep_nesting_is_refused_without_crashing() {
+    let n = 32_000; // `[` + `]` per level: the most that fits in 64 KiB
+    let cases = [
+        format!("a = {}{}", "[".repeat(n), "]".repeat(n)),
+        format!("a = {}1{}", "{b=".repeat(n / 2), "}".repeat(n / 2)),
+        format!("{} = 1", vec!["a"; n].join(".")),
+        format!("[{}]\nx = 1", vec!["a"; n].join(".")),
+    ];
+    for text in cases {
+        assert!(text.len() <= MAX_MANIFEST_BYTES);
+        let e = refused(&text);
+        assert!(
+            e.to_string().len() <= 1024,
+            "error message should be capped"
+        );
+    }
+}

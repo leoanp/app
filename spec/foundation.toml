@@ -86,7 +86,18 @@ never_bundle = ["libGLX_*.so.*", "libEGL_*.so.*"]
 id = "mesa"
 summary = "Mesa drivers, libdrm, libgbm"
 sonames = ["libdrm.so.2", "libgbm.so.1"]
-never_bundle = ["libdrm_*.so.*", "libglapi.so.*", "libgallium*.so", "*_dri.so"]
+never_bundle = [
+    "libdrm_*.so.*",
+    "libglapi.so.*",
+    "libgallium*.so",
+    "*_dri.so",
+    # GPU-specific libraries some drivers link (checked on Mesa 26.2)
+    "libLLVM*",
+    "libSPIRV-Tools*",
+    "libelf.so.*",
+    "libelf-*.so",
+    "libdisplay-info.so.*",
+]
 
 [[component]]
 id = "x11-driver-libs"
@@ -110,6 +121,14 @@ sonames = [
     "libXau.so.6",
     "libXdmcp.so.6",
 ]
+
+[[component]]
+id = "driver-deps"
+summary = "Libraries every GPU driver is built against (guaranteed set)"
+# Checked with readelf on Mesa 26.2 (Fedora 44, aarch64): every Mesa driver
+# links zlib, zstd and expat, every Vulkan driver links libudev, and libffi
+# comes with libwayland-client.
+sonames = ["libz.so.1", "libzstd.so.1", "libexpat.so.1", "libudev.so.1", "libffi.so.8"]
 
 [[component]]
 id = "libva"

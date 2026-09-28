@@ -26,7 +26,7 @@ Each of these was debated and chosen deliberately. Alternatives listed as reject
 
 | Decision | Why | Rejected alternative |
 | --- | --- | --- |
-| Small foundation (glibc, libstdc++/libgcc_s, Mesa/Vulkan, full libglvnd incl. `libGL.so.1`/`libGLX.so.0`/`libOpenGL.so.0`/EGL/GLES, libdrm/libgbm, a fixed set of X11 client libs Mesa's GLX is built against (libX11, libxcb and related), libva, Wayland client libs, libxkbcommon, PipeWire client, ALSA); everything else bundled | Only libraries that must come from the platform (drivers, or what drivers are built against) AND promise backward compatibility. Keeps apps working for years. The X11 set is fixed in `spec/foundation.toml`; platforms install all of it (may add, never drop) and build GL with GLX | Adding popular libs (SDL2, zlib, fontconfig, FreeType, HarfBuzz, libudev, OpenSSL, Qt, GTK, other X11 libs like libXrandr/libXi) to the foundation |
+| Small foundation (glibc, libstdc++/libgcc_s, Mesa/Vulkan, full libglvnd incl. `libGL.so.1`/`libGLX.so.0`/`libOpenGL.so.0`/EGL/GLES, libdrm/libgbm, the libs every GPU driver links (zlib, zstd, expat, libudev, libffi), a fixed set of X11 client libs Mesa's GLX is built against (libX11, libxcb and related), libva, Wayland client libs, libxkbcommon, PipeWire client, ALSA); everything else bundled | Only libraries that must come from the platform (drivers, or what drivers are built against) AND promise backward compatibility. Keeps apps working for years. The X11 set is fixed in `spec/foundation.toml`; platforms install all of it (may add, never drop) and build GL with GLX | Adding popular libs (SDL2, fontconfig, FreeType, HarfBuzz, OpenSSL, Qt, GTK, other X11 libs like libXrandr/libXi) to the foundation |
 | One `.app` file = EROFS image, LZ4 | Single sealed file, kernel-mounted, no FUSE helper | squashfs, FUSE mounting, AppImage-style runtime |
 | composefs + fs-verity on-device storage from day one | Identical files stored once, kernel-verified reads, delta updates | Plain loop-mounted images; adding dedup later |
 | Per-app Linux user IDs (per person × app) + app registry | Kernel-verified app identity for the portal; apps can't reach the person's session bus because its runtime dir is closed to other users | Identity by cgroup or pidfd only; running apps as the person's own user |
@@ -92,10 +92,10 @@ Mark all crates `publish = false` for now.
 Work in this order. Finish and test each step before starting the next.
 
 1. `spec/foundation.toml` + `crates/manifest` + `crates/foundation` (pure Rust, fully unit-tested, no system access).
-2. `crates/sandbox`: apply cgroup → groups/gid/uid → `PR_SET_NO_NEW_PRIVS` → Landlock `restrict_self` → seccomp → `execve`, in that order. Test with a fixture binary.
+2. `crates/sandbox`: apply cgroup → groups/gid/uid → `PR_SET_NO_NEW_PRIVS` → Landlock `restrict_self` → seccomp → `execve`, in that order. Test with a fixture binary. With `gamepad` granted, allow reading exactly what libudev-based gamepad discovery (SDL and others) needs under `/run/udev/data` and `/sys`, and nothing more.
 3. `crates/objects` + `crates/composefs`: import files by hash, enable fs-verity, build/verify the composefs image, mount with verity required.
 4. `crates/registry` + `bins/app-launcher`.
-5. `bins/app` with `install` and `run`.
+5. `bins/app` with `install` and `run`. `install` must run `app_manifest::bundle::check` and refuse any bundle containing a foundation or driver-internal library (classify every ELF file by its `DT_SONAME`, falling back to the file name, with `app_foundation::Foundation::classify`). Sideloaded bundles never pass through the packager, so the installer is the only guard.
 
    **Milestone 1 (proves the design on real hardware):** a hand-made fixture app (small program + one bundled `.so` + manifest), installed with `app install fixture.app` on the R36S and on an x86 dev machine, running as its own user. Tests must confirm it:
    - can read its own files and bundled library;
@@ -155,6 +155,7 @@ The launcher and installer run with root privileges; a bug there is a security h
 - Fail closed: if any protection can't be applied, do not exec.
 - Drop privileges in the documented order (section 4 step 2). Never exec anything as root on an app's behalf.
 - Validate every manifest and path from a bundle as untrusted input (no `..`, no absolute paths, no symlinks escaping the bundle, no device files, strip setuid/setgid).
+- Refuse bundles containing foundation or driver-internal libraries at install time, not only in the packager (spec section 5, rule 3).
 - Verify signatures and digests before using any downloaded data.
 - Every security property gets an escape test in `tests/sandbox/`.
 

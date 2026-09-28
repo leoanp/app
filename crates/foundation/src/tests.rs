@@ -35,6 +35,7 @@ fn spec_list_loads() {
             "libglvnd",
             "mesa",
             "x11-driver-libs",
+            "driver-deps",
             "libva",
             "wayland",
             "audio"
@@ -81,6 +82,11 @@ fn classifies_foundation_libraries() {
         ("libwayland-client.so.0", "wayland"),
         ("libpipewire-0.3.so.0", "audio"),
         ("libasound.so.2", "audio"),
+        ("libz.so.1", "driver-deps"),
+        ("libzstd.so.1", "driver-deps"),
+        ("libexpat.so.1", "driver-deps"),
+        ("libffi.so.8", "driver-deps"),
+        ("libudev.so.1", "driver-deps"),
     ] {
         match f.classify(name) {
             Class::Foundation(c) => assert_eq!(c.id, component, "{name}"),
@@ -101,6 +107,11 @@ fn classifies_driver_internal_libraries() {
         "radeonsi_drv_video.so",
         "iris_dri.so",
         "libglapi.so.0",
+        "libLLVM.so.22.1",
+        "libLLVM-17.so",
+        "libSPIRV-Tools.so",
+        "libelf.so.1",
+        "libdisplay-info.so.3",
     ] {
         assert!(
             matches!(f.classify(name), Class::DriverInternal(_)),
@@ -116,11 +127,9 @@ fn everything_else_is_bundled() {
     // Section 4's "always bundled" examples, including X11 libraries outside the guaranteed set.
     for name in [
         "libSDL2-2.0.so.0",
-        "libz.so.1",
         "libfontconfig.so.1",
         "libfreetype.so.6",
         "libharfbuzz.so.0",
-        "libudev.so.1",
         "libssl.so.3",
         "libXrandr.so.2",
         "libXi.so.6",
@@ -231,4 +240,25 @@ fn malformed_lists_are_refused() {
     );
     bad("format = 1\ncomponent = []\n[provides]\nopencl = \"3.0\"");
     bad("format = 1\ncomponent = []\n[provides]\nglibc = \"two\"");
+}
+
+#[test]
+fn recognizes_full_version_file_names() {
+    let f = spec();
+    for (file, component) in [
+        ("libstdc++.so.6.0.33", "cxx-runtime"),
+        ("libz.so.1.3.1", "driver-deps"),
+        ("libX11.so.6.4.0", "x11-driver-libs"),
+        ("libvulkan.so.1.4.321", "vulkan"),
+        ("libpipewire-0.3.so.0.1400.0", "audio"),
+    ] {
+        match f.classify(file) {
+            Class::Foundation(c) => assert_eq!(c.id, component, "{file}"),
+            other => panic!("{file} classified as {other:?}"),
+        }
+    }
+    // Only a `.` after the soname continues it.
+    for file in ["libc.so.60", "libz.so.10", "libGL.so.1x", "libz.so"] {
+        assert_eq!(f.classify(file), Class::Bundle, "{file}");
+    }
 }

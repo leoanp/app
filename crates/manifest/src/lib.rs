@@ -67,7 +67,13 @@ pub fn parse(text: &str) -> Result<Parsed, Error> {
     let table: toml::Table = match text.parse() {
         Ok(t) => t,
         Err(e) => {
-            r.invalid("", format!("manifest.toml is not valid TOML: {e}"));
+            r.invalid(
+                "",
+                format!(
+                    "manifest.toml is not valid TOML: {}",
+                    capped(&e.to_string())
+                ),
+            );
             return fail(r);
         }
     };
@@ -101,7 +107,7 @@ pub fn parse(text: &str) -> Result<Parsed, Error> {
     {
         Ok(m) => m,
         Err(e) => {
-            r.invalid("", e.to_string().trim_end());
+            r.invalid("", capped(e.to_string().trim_end()));
             return fail(r);
         }
     };
@@ -149,6 +155,15 @@ impl Manifest {
             return fail(r);
         }
         Ok(text)
+    }
+}
+
+/// Parser errors quote the offending line, which may be 64 KiB long.
+fn capped(message: &str) -> String {
+    const MAX: usize = 800;
+    match message.char_indices().nth(MAX) {
+        Some((i, _)) => format!("{}…", &message[..i]),
+        None => message.to_owned(),
     }
 }
 
