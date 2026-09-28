@@ -324,6 +324,7 @@ Every app runs under all of the layers below at once; each one covers gaps in th
 | Landlock | Allows only the files, devices and network actions listed below; blocks signals and abstract sockets to programs outside the app. |
 | seccomp | Blocks system calls an app never needs, and all internet sockets when network access is off. |
 | cgroup | Holds every process of the app, so the platform can measure, pause or stop the whole app. |
+| Private view of the filesystem | Hides the system's sockets and temporary files, and other people's and apps' processes. A defense layer, not a container: Landlock stays the main file boundary. |
 | Handed-in connections | The app gets connections to the compositor, the audio server, the app bus and the accessibility bus, and cannot open others. |
 | Wayland security context | The compositor knows each connection's app ID and refuses screen capture, global input and overlays over other apps. |
 | PipeWire restrictions | Playback only, unless the user grants the microphone or camera through the portal. |
@@ -336,14 +337,30 @@ Every app runs under all of the layers below at once; each one covers gaps in th
 - Read and run: the app's own mount, the foundation, and the system data listed in section 4.
 - Read, write and run: the app's own data folders (section 9). Apps may run programs and load plugins they placed there themselves, such as downloaded emulator cores or games, as with Flatpak; they stay inside the app's sandbox.
 - Read and write: shared folders, removable drives, the printing socket or the SSH agent socket the user granted, and files the user picked through the portal.
-- Devices: the GPU render node (drawing and video decoding, never screen control); granted game controllers, both their input devices and their raw HID devices for rumble, motion and Steam Input (never keyboards or touchscreens); and standard harmless devices such as `/dev/null` and `/dev/urandom`.
+- Devices: the GPU render node (drawing and video decoding, never screen control); granted game controllers, both their input devices and their raw HID devices for rumble, motion and Steam Input (never keyboards or touchscreens); and standard harmless devices such as `/dev/null` and `/dev/urandom`. For a granted controller, the app may also read exactly what libraries such as SDL need to find it: that controller's udev data files and its own folder under `/sys`, nothing about other devices.
+- Socket files: connecting is allowed only to the sockets the launcher hands in, where the kernel supports it (Landlock ABI 9, Linux 7.1). On older kernels, the private view below keeps other sockets out of reach.
 - Network: TCP connect and bind are allowed only when `network` is granted.
 
-**seccomp rules.** Blocks mounting, loading kernel code, kernel keyrings, performance monitoring, rebooting and changing system time. Blocks creating internet sockets (TCP and UDP) when `network` is off. It allows apps to create unprivileged user namespaces, because Chromium, Firefox and Electron build their own inner sandboxes with them; nothing created inside can escape the restrictions around it.
+**Private view of the filesystem.** Before dropping privileges, the launcher gives each app its own mount namespace, the same mechanism `compat.prefix` uses (section 5). It adds no running process.
 
-**Launch hardening.** The launcher sets no-new-privileges, so no program inside the app can gain rights, and applies Landlock and seccomp before starting the app. Both are inherited by every process the app starts.
+- Empty, private tmpfs folders cover `/run`, `/tmp`, `/var/tmp` and `/dev/shm`. World-writable sockets such as the system D-Bus, X11, CUPS and Avahi live there, so they are out of reach on every kernel. Nothing the app needs lives there: its connections are handed in, as file descriptors or as the individual sockets placed read-only into its private `/run`.
+- For granted game controllers, `/run/udev/data` stays visible, read-only.
+- `/proc` is a fresh instance mounted with `hidepid=invisible,subset=pid`: the app sees only its own processes, and none of the system-wide files.
+- Mounts made outside after launch, such as a newly inserted USB drive, still appear inside; nothing mounted inside leaks out. The app cannot undo the private view: mounting and unmounting are blocked by seccomp.
 
-**Fail closed.** The runtime must refuse to start any app if a required protection is unavailable. Platforms need Linux with Landlock ABI 6 or newer (Linux 6.12), fs-verity, EROFS, composefs support, cgroup v2, seccomp, the Wayland security context protocol in the compositor, and unprivileged user namespaces allowed for app accounts.
+**seccomp rules.** Blocked system calls fail with an error the app can handle:
+
+- mounting (`mount`, `umount2`, `pivot_root` and the new mount API);
+- loading kernel code (kernel modules, `kexec`, `bpf`);
+- kernel keyrings, performance monitoring (`perf_event_open`), rebooting, and changing the system time;
+- other administration no app needs: `syslog`, `acct`, `quotactl`, `swapon`, `swapoff`, `ioperm`, `iopl`, `uselib`, `vhangup`;
+- io_uring, because it can open network connections without the `socket` call; libraries fall back to ordinary calls.
+
+Sockets: an app may create local (Unix) sockets, and internet sockets (IPv4 and IPv6, TCP and UDP) only when `network` is granted. Netlink is limited to `NETLINK_ROUTE` (glibc's name lookups) and `NETLINK_KOBJECT_UEVENT` (device hotplug events for udev); every other netlink type and every other socket family, including raw packet sockets, is refused, even with `network`. It allows apps to create unprivileged user namespaces, because Chromium, Firefox and Electron build their own inner sandboxes with them; nothing created inside can escape the restrictions around it.
+
+**Launch hardening.** The launcher applies the layers in this order: cgroup, private view, the app's account and groups, no-new-privileges (so no program inside the app can gain rights), Landlock, seccomp. It then starts the app with only the environment and file descriptors it hands in; nothing else the launcher had open reaches the app, since Landlock does not restrict files that are already open. Every layer is inherited by every process the app starts.
+
+**Fail closed.** The runtime must refuse to start any app if a required protection is unavailable. Platforms need Linux with Landlock ABI 6 or newer (Linux 6.12), fs-verity, EROFS, composefs support, cgroup v2, seccomp, mount namespaces, the Wayland security context protocol in the compositor, and unprivileged user namespaces allowed for app accounts.
 
 ## 8. Permissions
 

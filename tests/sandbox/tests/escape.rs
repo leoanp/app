@@ -24,6 +24,9 @@ const EPERM: &str = "err 1";
 const EACCES: &str = "err 13";
 const ENOSYS: &str = "err 38";
 const EAFNOSUPPORT: &str = "err 97";
+const ENOENT: &str = "err 2";
+const EROFS: &str = "err 30";
+const EPROTONOSUPPORT: &str = "err 93";
 
 /// A private folder tree for one test, plus a cgroup.
 struct World {
@@ -37,9 +40,14 @@ impl World {
             rustix_is_root(),
             "sandbox escape tests must run as root (use tests/vm/sandbox-tests.sh)"
         );
-        let root = PathBuf::from(format!("/tmp/app-sbx-{name}-{}", std::process::id()));
+        // Not in /tmp: the app sees its own empty /tmp.
+        let root = PathBuf::from(format!(
+            "/var/lib/app-sandbox-test/{name}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("app/bin")).unwrap();
+        fs::set_permissions(root.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         fs::copy(env!("CARGO_BIN_EXE_probe"), root.join("app/bin/probe")).unwrap();
 
@@ -450,4 +458,133 @@ fn fails_closed_on_a_bad_policy() {
         );
         assert!(o.results.is_empty(), "{bad:?}: the probe must not run");
     }
+}
+
+// ---- Private mount namespace ----------------------------------------------
+
+/// World-writable sockets in /run and /tmp (the system D-Bus, X11, CUPS,
+/// Avahi) must be unreachable on every kernel, including before Landlock ABI 9.
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn system_bus_and_tmp_sockets_are_unreachable() {
+    let bus = Path::new("/run/dbus/system_bus_socket");
+    assert!(bus.exists(), "the test system needs a system D-Bus");
+    let tmp_sock = PathBuf::from(format!("/tmp/app-sbx-sock-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp_sock);
+    let _listener = std::os::unix::net::UnixListener::bind(&tmp_sock).unwrap();
+    fs::set_permissions(&tmp_sock, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let w = World::new("hidden");
+    let a_bus = format!("unix:{}", bus.display());
+    let a_tmp = format!("unix:{}", tmp_sock.display());
+    let o = w.run(&[], &[&a_bus, &a_tmp]);
+    let _ = fs::remove_file(&tmp_sock);
+    o.expect(&a_bus, ENOENT);
+    o.expect(&a_tmp, ENOENT);
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn proc_shows_only_its_own_processes() {
+    let w = World::new("proc");
+    let o = w.run(
+        &[],
+        &[
+            "read:/proc/self/status",
+            "read:/proc/1/status",
+            "list:/proc/1",
+            "read:/proc/cpuinfo",
+            "read:/proc/sys/kernel/hostname",
+        ],
+    );
+    o.expect("read:/proc/self/status", "ok");
+    o.expect("read:/proc/1/status", ENOENT); // root's process: invisible
+    o.expect("list:/proc/1", ENOENT);
+    o.expect("read:/proc/cpuinfo", ENOENT); // subset=pid: no system-wide files
+    o.expect("read:/proc/sys/kernel/hostname", ENOENT);
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn private_tmp_is_empty_and_its_own() {
+    let marker = PathBuf::from(format!("/tmp/app-sbx-marker-{}", std::process::id()));
+    fs::write(&marker, "host").unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+    let written = PathBuf::from(format!("/tmp/app-sbx-written-{}", std::process::id()));
+    let _ = fs::remove_file(&written);
+
+    let w = World::new("privtmp");
+    let a_marker = format!("read:{}", marker.display());
+    let a_write = format!("write:{}", written.display());
+    let o = w.run(&["--rule", "read-write:/tmp"], &[&a_marker, &a_write]);
+    let _ = fs::remove_file(&marker);
+    o.expect(&a_marker, ENOENT); // the host's /tmp is not visible
+    o.expect(&a_write, "ok"); // its own /tmp works
+    assert!(
+        !written.exists(),
+        "the write must stay inside the app's private /tmp"
+    );
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn binds_are_read_only_and_only_what_was_asked() {
+    assert!(
+        Path::new("/run/udev/data").is_dir(),
+        "the test system needs udev"
+    );
+    let w = World::new("binds");
+    let args = [
+        "--bind",
+        "/run/udev/data:/run/udev/data",
+        "--rule",
+        "read-write:/run/udev",
+    ];
+    let o = w.run(
+        &args,
+        &[
+            "list:/run/udev/data",
+            "write:/run/udev/data/x",
+            "list:/run/dbus",
+            "write:/run/new",
+        ],
+    );
+    o.expect("list:/run/udev/data", "ok");
+    o.expect("write:/run/udev/data/x", EROFS);
+    o.expect("list:/run/dbus", ENOENT);
+    o.expect("write:/run/new", EACCES); // Landlock: /run itself was not granted
+    // Without the bind, udev data is not there at all.
+    w.run(&["--rule", "read:/run/udev"], &["list:/run/udev/data"])
+        .expect("list:/run/udev/data", ENOENT);
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn cannot_undo_the_private_view() {
+    let w = World::new("umount");
+    let o = w.run(&[], &["umount:/run", "umount:/proc", "umount:/tmp"]);
+    for a in ["umount:/run", "umount:/proc", "umount:/tmp"] {
+        o.expect(a, EPERM);
+    }
+}
+
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn only_route_and_uevent_netlink() {
+    let w = World::new("netlink");
+    let o = w.run(
+        &[],
+        &[
+            "netlink:0",
+            "netlink:15",
+            "netlink:9",
+            "netlink:4",
+            "netlink:16",
+        ],
+    );
+    o.expect("netlink:0", "ok"); // NETLINK_ROUTE
+    o.expect("netlink:15", "ok"); // NETLINK_KOBJECT_UEVENT
+    o.expect("netlink:9", EPROTONOSUPPORT); // NETLINK_AUDIT
+    o.expect("netlink:4", EPROTONOSUPPORT); // NETLINK_SOCK_DIAG
+    o.expect("netlink:16", EPROTONOSUPPORT); // NETLINK_GENERIC
 }

@@ -135,6 +135,18 @@ mod linux {
                     libc::mount(src.as_ptr(), tgt.as_ptr(), fs.as_ptr(), 0, std::ptr::null())
                 } as _)
             }
+            "netlink" => {
+                let proto: libc::c_long = param.parse().unwrap_or(-1);
+                sys(
+                    libc::SYS_socket,
+                    [libc::AF_NETLINK as _, libc::SOCK_RAW as _, proto, 0],
+                )
+            }
+            "umount" => {
+                let target = c(param);
+                // SAFETY: valid C string; expected to be refused.
+                check(unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } as _)
+            }
             "keyctl" => sys(libc::SYS_keyctl, [0, 0, 0, 0]),
             "bpf" => sys(libc::SYS_bpf, [0, 0, 0, 0]),
             "perf" => sys(libc::SYS_perf_event_open, [0, 0, -1, -1]),

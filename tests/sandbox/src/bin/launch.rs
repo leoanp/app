@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! launch --uid N --gid N [--group N]... --cgroup PATH [--net]
-//!        [--rule ACCESS:PATH]... [--keep FD] [--open-leak PATH] [--env K=V]...
+//!        [--rule ACCESS:PATH]... [--bind SOURCE:TARGET]... [--keep FD]
+//!        [--open-leak PATH] [--env K=V]...
 //!        -- PROGRAM [ARGS]...
 //! ```
 //! ACCESS is one of read, read-exec, read-write, read-write-exec, device, connect.
@@ -26,7 +27,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use app_sandbox::{Access, Command, PathRule, Policy};
+    use app_sandbox::{Access, Bind, Command, PathRule, Policy};
 
     pub fn run() -> String {
         let mut args = std::env::args_os().skip(1);
@@ -36,6 +37,7 @@ mod linux {
             groups: vec![],
             cgroup: Default::default(),
             paths: vec![],
+            binds: vec![],
             network: false,
             keep_fds: vec![],
         };
@@ -89,6 +91,16 @@ mod linux {
                     policy.paths.push(PathRule {
                         path: path.into(),
                         access,
+                    });
+                }
+                "--bind" => {
+                    let v = val();
+                    let Some((source, target)) = v.split_once(':') else {
+                        return format!("bad bind {v}");
+                    };
+                    policy.binds.push(Bind {
+                        source: source.into(),
+                        target: target.into(),
                     });
                 }
                 "--" => {

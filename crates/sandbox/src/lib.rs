@@ -3,11 +3,14 @@
 //! The protections are applied in this order, then the program is executed:
 //!
 //! 1. cgroup: the process joins the app's cgroup;
-//! 2. identity: supplementary groups, group ID, user ID (all three of real,
+//! 2. private mount namespace: empty tmpfs over `/run`, `/tmp`, `/var/tmp`
+//!    and `/dev/shm`, a `/proc` showing only the app's own processes, and
+//!    any read-only [`Bind`]s the launcher asks for;
+//! 3. identity: supplementary groups, group ID, user ID (all three of real,
 //!    effective and saved), after which the process holds no capabilities;
-//! 3. `PR_SET_NO_NEW_PRIVS`: nothing the app runs can gain rights;
-//! 4. Landlock: files, devices, network ports, signals, abstract sockets;
-//! 5. seccomp: blocked system calls and socket types.
+//! 4. `PR_SET_NO_NEW_PRIVS`: nothing the app runs can gain rights;
+//! 5. Landlock: files, devices, network ports, signals, abstract sockets;
+//! 6. seccomp: blocked system calls and socket types.
 //!
 //! Everything fails closed: if any step cannot be applied, [`exec`] returns
 //! an error and nothing is executed. Before the first step, every open file
@@ -26,6 +29,7 @@ mod fds;
 mod identity;
 mod kernel;
 mod landlock_rules;
+mod mount_ns;
 mod seccomp;
 
 use std::ffi::OsString;
@@ -33,7 +37,8 @@ use std::os::fd::RawFd;
 use std::path::{Component, PathBuf};
 
 pub use kernel::{KernelInfo, MIN_LANDLOCK_ABI, check_kernel};
-pub use seccomp::BLOCKED_SYSCALLS;
+pub use mount_ns::{HIDDEN, PROC_OPTIONS};
+pub use seccomp::{BLOCKED_SYSCALLS, NETLINK_ALLOWED};
 
 /// What an app may do. Built by the launcher from the manifest, the
 /// registry and the user's permission choices.
@@ -47,12 +52,24 @@ pub struct Policy {
     pub groups: Vec<u32>,
     /// The app's cgroup: an absolute path under `/sys/fs/cgroup`, created if missing.
     pub cgroup: PathBuf,
-    /// Landlock rules. Anything not listed is denied.
+    /// Landlock rules. Anything not listed is denied. Paths are resolved in
+    /// the app's private view, so `/tmp` means its own empty tmpfs.
     pub paths: Vec<PathRule>,
+    /// Read-only copies of outside files or folders placed into the private
+    /// view, below one of [`HIDDEN`]: `/run/udev/data` for granted game
+    /// controllers, sockets the app connects to by path.
+    pub binds: Vec<Bind>,
     /// Whether TCP/UDP networking is allowed (`permissions.network`).
     pub network: bool,
     /// File descriptors handed to the app besides 0, 1 and 2.
     pub keep_fds: Vec<RawFd>,
+}
+
+/// A read-only bind of `source` (outside) at `target` (inside the private view).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bind {
+    pub source: PathBuf,
+    pub target: PathBuf,
 }
 
 /// Access to one file or directory tree.
@@ -99,6 +116,8 @@ pub enum Error {
     Kernel(String),
     #[error("could not join the app's cgroup: {0}")]
     Cgroup(String),
+    #[error("could not set up the app's private view of the filesystem: {0}")]
+    MountNamespace(String),
     #[error("could not prepare file descriptors: {0}")]
     Fds(String),
     #[error("could not switch to the app's account: {0}")]
@@ -128,11 +147,12 @@ pub fn exec(policy: &Policy, command: &Command) -> Error {
 pub fn apply(policy: &Policy) -> Result<(), Error> {
     validate(policy)?;
     let info = check_kernel()?;
-    // Prepared while still privileged, so failures surface before any change.
-    let ruleset = landlock_rules::prepare(policy, &info)?;
     let filter = seccomp::prepare(policy.network)?;
 
     cgroup::join(&policy.cgroup)?;
+    mount_ns::enter(&policy.binds)?;
+    // Built inside the private view, so rules name its files, not the host's.
+    let ruleset = landlock_rules::prepare(policy, &info)?;
     fds::close_on_exec_except(&policy.keep_fds)?;
     identity::switch(policy.uid, policy.gid, &policy.groups)?;
     rustix::thread::set_no_new_privs(true).map_err(|e| Error::NoNewPrivs(e.to_string()))?;
@@ -166,6 +186,15 @@ fn validate(policy: &Policy) -> Result<(), Error> {
             r.path.display()
         )));
     }
+    for b in &policy.binds {
+        if !b.source.is_absolute() || !plain(&b.source) || !plain(&b.target) {
+            return Err(Error::Policy(format!(
+                "bind `{}` must use plain absolute paths",
+                b.target.display()
+            )));
+        }
+    }
+    mount_ns::validate(&policy.binds).map_err(Error::Policy)?;
     if policy.keep_fds.iter().any(|fd| *fd < 0) {
         return bad("negative file descriptor");
     }
@@ -193,6 +222,7 @@ mod tests {
             groups: vec![],
             cgroup: "/sys/fs/cgroup/app/test".into(),
             paths: vec![],
+            binds: vec![],
             network: false,
             keep_fds: vec![],
         }

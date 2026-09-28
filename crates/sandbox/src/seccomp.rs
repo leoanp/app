@@ -60,7 +60,9 @@ pub const BLOCKED_SYSCALLS: &[&str] = &[
 /// fall back to ordinary system calls.
 const NO_IO_URING: &[&str] = &["io_uring_setup", "io_uring_enter", "io_uring_register"];
 
-/// Socket families an app may create. Everything else fails with `EAFNOSUPPORT`.
+/// Socket families an app may create: local sockets, netlink (limited to
+/// [`NETLINK_ALLOWED`]), and internet sockets with `network`. Everything
+/// else fails with `EAFNOSUPPORT`.
 fn allowed_families(network: bool) -> Vec<i32> {
     let mut f = vec![libc::AF_UNIX, libc::AF_NETLINK];
     if network {
@@ -112,8 +114,33 @@ pub(crate) fn prepare(network: bool) -> Result<ScmpFilterContext, Error> {
                 .map_err(err)?;
         }
     }
+
+    // Netlink: only routing information (glibc's name lookups) and device
+    // hotplug events (udev) are allowed.
+    let socket = syscall("socket")?;
+    let netlink = ScmpArgCompare::new(
+        0,
+        ScmpCompareOp::MaskedEqual(0xffff_ffff),
+        libc::AF_NETLINK as u64,
+    );
+    for protocol in (0..NETLINK_LIMIT).filter(|p| !NETLINK_ALLOWED.contains(p)) {
+        let proto =
+            ScmpArgCompare::new(2, ScmpCompareOp::MaskedEqual(0xffff_ffff), protocol as u64);
+        f.add_rule_conditional(
+            ScmpAction::Errno(libc::EPROTONOSUPPORT),
+            socket,
+            &[netlink, proto],
+        )
+        .map_err(err)?;
+    }
     Ok(f)
 }
+
+/// Netlink protocols an app may use.
+pub const NETLINK_ALLOWED: &[i32] = &[libc::NETLINK_ROUTE, libc::NETLINK_KOBJECT_UEVENT];
+
+/// The kernel's number of netlink protocols (`MAX_LINKS`); it refuses higher ones itself.
+const NETLINK_LIMIT: i32 = 32;
 
 fn syscall(name: &str) -> Result<ScmpSyscall, Error> {
     ScmpSyscall::from_name(name)

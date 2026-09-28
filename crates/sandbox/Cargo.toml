@@ -17,7 +17,7 @@ workspace = true
 landlock = "0.4.7"
 libc = "0.2.189"
 libseccomp = "0.4.0"
-rustix = { version = "1.1.5", features = ["process", "thread", "fs", "system"] }
+rustix = { version = "1.1.5", features = ["process", "thread", "fs", "system", "mount"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
