@@ -16,9 +16,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Test-only account numbers. The real app range is chosen in step 4.
-const APP_UID: u32 = 1_900_000_001;
-const OTHER_UID: u32 = 1_900_000_002;
+/// Test-only account numbers, from block 0x7000, which the spec reserves
+/// for the runtime and tests (0x70000000 itself is the shared app group).
+const APP_UID: u32 = 0x7000_0001;
+const OTHER_UID: u32 = 0x7000_0002;
 
 const EPERM: &str = "err 1";
 const EACCES: &str = "err 13";
@@ -41,10 +42,10 @@ impl World {
             "sandbox escape tests must run as root (use tests/vm/sandbox-tests.sh)"
         );
         // Not in /tmp: the app sees its own empty /tmp.
-        let root = PathBuf::from(format!(
-            "/var/lib/app-sandbox-test/{name}-{}",
-            std::process::id()
-        ));
+        // APP_SANDBOX_TEST_DIR lets CI use a disk of its own.
+        let base = std::env::var("APP_SANDBOX_TEST_DIR")
+            .unwrap_or_else(|_| "/var/lib/app-sandbox-test".into());
+        let root = PathBuf::from(format!("{base}/{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("app/bin")).unwrap();
         fs::set_permissions(root.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
@@ -477,20 +478,36 @@ fn fails_closed_on_a_bad_policy() {
 #[test]
 #[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
 fn system_bus_and_tmp_sockets_are_unreachable() {
+    // Stand-ins for world-writable system sockets in /run and /tmp, so the
+    // test also works where no system services run (CI guests); the real
+    // system D-Bus is checked too wherever it exists.
+    let pid = std::process::id();
+    let run_sock = PathBuf::from(format!("/run/app-sbx-bus-{pid}.sock"));
+    let tmp_sock = PathBuf::from(format!("/tmp/app-sbx-sock-{pid}"));
+    let mut listeners = Vec::new();
+    for s in [&run_sock, &tmp_sock] {
+        let _ = fs::remove_file(s);
+        listeners.push(std::os::unix::net::UnixListener::bind(s).unwrap());
+        fs::set_permissions(s, fs::Permissions::from_mode(0o777)).unwrap();
+    }
     let bus = Path::new("/run/dbus/system_bus_socket");
-    assert!(bus.exists(), "the test system needs a system D-Bus");
-    let tmp_sock = PathBuf::from(format!("/tmp/app-sbx-sock-{}", std::process::id()));
-    let _ = fs::remove_file(&tmp_sock);
-    let _listener = std::os::unix::net::UnixListener::bind(&tmp_sock).unwrap();
-    fs::set_permissions(&tmp_sock, fs::Permissions::from_mode(0o777)).unwrap();
+    let mut attempts = vec![
+        format!("unix:{}", run_sock.display()),
+        format!("unix:{}", tmp_sock.display()),
+    ];
+    if bus.exists() {
+        attempts.push(format!("unix:{}", bus.display()));
+    }
 
     let w = World::new("hidden");
-    let a_bus = format!("unix:{}", bus.display());
-    let a_tmp = format!("unix:{}", tmp_sock.display());
-    let o = w.run(&[], &[&a_bus, &a_tmp]);
-    let _ = fs::remove_file(&tmp_sock);
-    o.expect(&a_bus, ENOENT);
-    o.expect(&a_tmp, ENOENT);
+    let refs: Vec<&str> = attempts.iter().map(String::as_str).collect();
+    let o = w.run(&[], &refs);
+    for s in [&run_sock, &tmp_sock] {
+        let _ = fs::remove_file(s);
+    }
+    for a in &attempts {
+        o.expect(a, ENOENT);
+    }
 }
 
 #[test]
@@ -514,7 +531,7 @@ fn proc_shows_only_its_own_processes() {
     o.expect("read:/proc/cpuinfo", "ok");
     o.expect("read:/proc/meminfo", "ok");
     o.expect("read:/proc/stat", "ok");
-    o.expect("write:/proc/self/comm", EACCES); // read-only
+    o.expect("write:/proc/self/comm", "ok"); // its own process: writable
 }
 
 #[test]
@@ -542,17 +559,13 @@ fn private_tmp_is_empty_and_its_own() {
 #[test]
 #[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
 fn binds_are_read_only_and_only_what_was_asked() {
-    assert!(
-        Path::new("/run/udev/data").is_dir(),
-        "the test system needs udev"
-    );
+    // A stand-in for /run/udev/data, so the test does not need udev running.
+    let source = PathBuf::from(format!("/run/app-sbx-udev-{}", std::process::id()));
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("c13:64"), "E:ID_INPUT_JOYSTICK=1\n").unwrap();
     let w = World::new("binds");
-    let args = [
-        "--bind",
-        "/run/udev/data:/run/udev/data",
-        "--rule",
-        "read-write:/run/udev",
-    ];
+    let bind = format!("{}:/run/udev/data", source.display());
+    let args = ["--bind", &bind, "--rule", "read-write:/run/udev"];
     let o = w.run(
         &args,
         &[
@@ -566,6 +579,7 @@ fn binds_are_read_only_and_only_what_was_asked() {
     o.expect("write:/run/udev/data/x", EROFS);
     o.expect("list:/run/dbus", ENOENT);
     o.expect("write:/run/new", EACCES); // Landlock: /run itself was not granted
+    let _ = fs::remove_dir_all(&source);
     // Without the bind, udev data is not there at all.
     w.run(&["--rule", "read:/run/udev"], &["list:/run/udev/data"])
         .expect("list:/run/udev/data", ENOENT);
@@ -669,4 +683,13 @@ fn placed_socket_reachable_unplaced_not() {
     o.expect(placed, "ok");
     o.expect(&unplaced, ENOENT);
     o.expect(&original, ENOENT);
+}
+
+/// Chromium, Electron and Firefox build their inner sandbox by creating a
+/// user namespace and writing their own ID mapping to /proc/self/uid_map.
+#[test]
+#[ignore = "needs root and Linux 6.12+; run tests/vm/sandbox-tests.sh"]
+fn browser_inner_sandbox_setup_works() {
+    let w = World::new("uidmap");
+    w.run(&[], &["userns-map"]).expect("userns-map", "ok");
 }

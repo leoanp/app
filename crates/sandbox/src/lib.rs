@@ -5,7 +5,7 @@
 //! 1. cgroup: the process joins the app's cgroup;
 //! 2. private mount namespace: empty tmpfs over `/run`, `/tmp`, `/var/tmp`
 //!    and `/dev/shm`, a `/proc` showing only the app's own processes
-//!    (always granted read-only), and
+//!    (always granted read-write, never executable), and
 //!    any read-only [`Bind`]s the launcher asks for;
 //! 3. identity: supplementary groups, group ID, user ID (all three of real,
 //!    effective and saved), after which the process holds no capabilities;

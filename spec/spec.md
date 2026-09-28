@@ -330,7 +330,13 @@ Every app runs under all of the layers below at once; each one covers gaps in th
 | PipeWire restrictions | Playback only, unless the user grants the microphone or camera through the portal. |
 | composefs and fs-verity | App files are read-only and checked by the kernel on every read. |
 
-**User accounts and the app registry.** The platform reserves a range of user IDs for apps and assigns one per person and app, like Android. Numbers must be unique, stay stable across updates, and are not reused while the account's data exists. All app accounts belong to one app group, used for shared folders (section 8). The runtime records which account belongs to which app and person in the **app registry**, a list only the system can write. The portal and every other platform service identify a calling app by looking up its account there, as Android's system services do. The person's session bus lives in a folder only the person can enter, so apps cannot reach it.
+**User accounts and the app registry.** The platform reserves a range of user IDs for apps and assigns one per person and app, like Android. Numbers must be unique, stay stable across updates, and are not reused while the account's data exists.
+
+- **Range:** `0x70000000`–`0x7FFDFFFF` (1879048192–2147352575), for both user and group IDs. systemd documents this range as unused. It stays below 2³¹, which some kernel and program code cannot handle, and clear of systemd's own ranges, its foreign-image range (`0x7FFE0000`) and the usual `/etc/subuid` allocations.
+- **Blocks:** the range is split into 4094 blocks of 65536, as systemd's container convention does: the upper 16 bits name the block, the lower 16 bits the slot.
+- **Block `0x7000`** is reserved for the runtime and its tests. `0x70000000` is the shared app group.
+- **Every other block belongs to one person**, and each app that person installs gets one slot in it. Each app account's primary group has the same number as the account.
+- The registry assigns blocks and slots. App accounts appear in the system's user database, as systemd asks of every program that allocates IDs. All app accounts belong to one app group, used for shared folders (section 8). The runtime records which account belongs to which app and person in the **app registry**, a list only the system can write. The portal and every other platform service identify a calling app by looking up its account there, as Android's system services do. The person's session bus lives in a folder only the person can enter, so apps cannot reach it.
 
 **Landlock rules**
 
@@ -345,7 +351,7 @@ Every app runs under all of the layers below at once; each one covers gaps in th
 
 - Empty, private tmpfs folders cover `/run`, `/tmp`, `/var/tmp` and `/dev/shm`. World-writable sockets such as the system D-Bus, X11, CUPS and Avahi live there, so they are out of reach on every kernel. Nothing the app needs lives there: its connections are handed in, as file descriptors or as the individual sockets placed read-only into its private `/run`.
 - For granted game controllers, `/run/udev/data` stays visible, read-only.
-- `/proc` is a fresh instance mounted with `hidepid=invisible`: the app sees only its own processes, plus the system-wide files many runtimes read (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`). Landlock grants it read-only.
+- `/proc` is a fresh instance mounted with `hidepid=invisible`: the app sees only its own processes, plus the system-wide files many runtimes read (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`). Landlock grants it read and write, never run: Chromium, Electron and Firefox write their own ID mapping (`/proc/self/uid_map`) to build their inner sandboxes. Ordinary file permissions still limit writes to the app's own processes, and system settings under `/proc/sys` stay closed.
 - Mounts made outside after launch, such as a newly inserted USB drive, still appear inside; nothing mounted inside leaks out. The app cannot undo the private view: mounting and unmounting are blocked by seccomp.
 
 **seccomp rules.** Blocked system calls fail with an error the app can handle:
@@ -616,7 +622,7 @@ The format defines what every platform must do the same way; everything else is 
 
 **Details to settle during implementation**
 
-- [ ] The exact user ID ranges and numbering scheme.
+- [ ] How app accounts appear in the system's user database (systemd's drop-in user records, or `/etc/passwd`).
 - [ ] The app bus's configuration.
 - [ ] How the portal's document store is made reachable by app accounts.
 - [ ] Proposing the portal change upstream.

@@ -79,7 +79,7 @@ impl Store {
         f.write_all(b"verity probe").map_err(io_err("probe"))?;
         let path = f.into_temp_path();
         let file = File::open(&path).map_err(io_err("probe"))?;
-        match fs_ioc_enable_verity(&file, SHA256, BLOCK_SIZE as u32) {
+        match enable_verity(&file) {
             Ok(()) => Ok(()),
             Err(EnableVerityError::FilesystemNotSupported) => {
                 Err(Error::VerityUnsupported(self.root.clone()))
@@ -119,7 +119,7 @@ impl Store {
         // fs-verity needs the file closed for writing.
         let tmp_path = tmp.into_temp_path();
         let file = File::open(&tmp_path).map_err(io_err("reopening"))?;
-        match fs_ioc_enable_verity(&file, SHA256, BLOCK_SIZE as u32) {
+        match enable_verity(&file) {
             Ok(()) => {}
             Err(EnableVerityError::FilesystemNotSupported) => {
                 return Err(Error::VerityUnsupported(self.root.clone()));
@@ -237,6 +237,24 @@ pub fn reopen_for_reading(pinned: &OwnedFd, name: &Path) -> Result<File, Error> 
     Ok(File::from(fd))
 }
 
+/// Enables fs-verity, retrying briefly while the file is "busy". The kernel
+/// refuses while any descriptor holds the file open for writing. When this
+/// process starts another program, the child briefly holds copies of our
+/// descriptors (closed again as that program starts), which can collide
+/// with an import running in another thread.
+fn enable_verity(file: &File) -> Result<(), EnableVerityError> {
+    const TRIES: u32 = 100;
+    for _ in 1..TRIES {
+        match fs_ioc_enable_verity(file, SHA256, BLOCK_SIZE as u32) {
+            Err(EnableVerityError::FileOpenedForWrite) => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            other => return other,
+        }
+    }
+    fs_ioc_enable_verity(file, SHA256, BLOCK_SIZE as u32)
+}
+
 /// Asks the kernel for a file's fs-verity digest.
 pub fn measure(file: &File, path: &Path) -> Result<Digest, Error> {
     fs_ioc_measure_verity::<32>(file, SHA256)
@@ -251,7 +269,7 @@ pub fn measure(file: &File, path: &Path) -> Result<Digest, Error> {
 /// returns the kernel's digest. The file must not be open for writing.
 pub fn seal(path: &Path) -> Result<Digest, Error> {
     let file = File::open(path).map_err(io_err(path.display()))?;
-    match fs_ioc_enable_verity(&file, SHA256, BLOCK_SIZE as u32) {
+    match enable_verity(&file) {
         Ok(()) | Err(EnableVerityError::AlreadyEnabled) => {}
         Err(EnableVerityError::FilesystemNotSupported) => {
             return Err(Error::VerityUnsupported(path.to_owned()));

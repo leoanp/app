@@ -1,0 +1,55 @@
+# Lima VM for the kernel-dependent tests: Fedora 44 Cloud, pinned exactly.
+# Created by tests/vm/lima-fedora.sh; do not start it by hand.
+#
+# Everything is pinned: the image by checksum, every package to the version
+# in Fedora 44's frozen release repository (the "updates" repository is
+# never used, since it drops old versions), and Rust to exact releases.
+
+minimumLimaVersion: "2.0.0"
+vmType: vz
+
+images:
+  - location: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
+    arch: aarch64
+    digest: "sha256:55c60a3b80d3616a08705afd0459e75fe9f03c54aba7a46e4002a41a72fa0d5b"
+  - location: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+    arch: x86_64
+    digest: "sha256:28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f"
+
+cpus: 4
+memory: 6GiB
+# The root filesystem is btrfs, which supports fs-verity (tests use /var/tmp).
+disk: 40GiB
+
+# The repository mount is added by lima-fedora.sh (it knows the path).
+mounts: []
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      # Frozen release repository only. After Fedora 44's end of life its
+      # packages move to archives.fedoraproject.org; point the "fedora"
+      # repository there (--setopt=fedora.baseurl=...) if downloads fail.
+      dnf install -y --disablerepo='*' --enablerepo=fedora --setopt=install_weak_deps=False \
+        composefs-1.0.8-5.fc44 \
+        fsverity-utils-1.6-4.fc44 \
+        erofs-utils-1.9.1-1.fc44 \
+        libseccomp-devel-2.6.0-3.fc44 \
+        gcc-16.0.1-0.10.fc44 \
+        clang-22.1.1-2.fc44 \
+        binutils-2.46-1.fc44 \
+        pkgconf-pkg-config-2.5.1-1.fc44 \
+        e2fsprogs-1.47.3-4.fc44 \
+        rustup-1.29.0-2.fc44
+  - mode: user
+    script: |
+      #!/bin/sh
+      set -eu
+      rustup-init -y -q --profile minimal --default-toolchain 1.98.1 -c clippy -c rustfmt
+      . "$HOME/.cargo/env"
+      # Named "1.88" because the scripts and CI use `cargo +1.88` (it is 1.88.0).
+      rustup toolchain install 1.88 --profile minimal
+      # rust-toolchain.toml asks for "stable"; pin it to the exact release here.
+      grep -q RUSTUP_TOOLCHAIN "$HOME/.cargo/env" || echo 'export RUSTUP_TOOLCHAIN=1.98.1' >> "$HOME/.cargo/env"

@@ -179,3 +179,41 @@ fn swapped_entry_cannot_pull_in_an_outside_file() {
     // And a fresh attempt now refuses the symlink outright.
     assert!(crate::open_regular(&parent, name).is_err());
 }
+
+/// Imports while another thread keeps starting programs. Each started
+/// program briefly holds copies of this process's open files, which makes
+/// the kernel refuse to seal a file ("opened for writing"). Without the
+/// retry in `enable_verity`, about 1 in 5 imports failed here.
+#[test]
+#[ignore = "needs a filesystem with fs-verity; run tests/vm/storage-tests.sh"]
+fn imports_survive_programs_started_concurrently() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = test_dir();
+    let store = Store::open(dir.path().join("store")).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::process::Command::new("/usr/bin/true").status();
+            }
+        })
+    };
+    let failures: Vec<String> = (0..300u32)
+        .filter_map(|i| {
+            store
+                .import(&i.to_le_bytes()[..])
+                .err()
+                .map(|e| e.to_string())
+        })
+        .collect();
+    stop.store(true, Ordering::Relaxed);
+    spawner.join().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} imports failed, first: {}",
+        failures.len(),
+        failures[0]
+    );
+}

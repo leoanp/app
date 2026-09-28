@@ -2,6 +2,27 @@
 
 Read this file and `spec/spec.md` before doing anything. The spec is the source of truth for **what** to build; this file explains **why**, what was deliberately rejected, and **how** to build it.
 
+## Current status (paused 2026-09-28, tag `pause-2026-09-28`)
+
+**Done:** steps 1–3, plus sandbox extras beyond the original plan.
+- Step 1: `spec/foundation.toml` (incl. the guaranteed X11 and GPU-driver-dependency sets), `app-manifest` (all section 6 rules; 41 tests + 1 doc test), `app-foundation` (10 tests).
+- Step 2: `app-sandbox`: setsid, cgroup, private mount namespace (tmpfs over `/run`, `/tmp`, `/var/tmp`, `/dev/shm`; `/proc` with `hidepid=invisible`, read-write, never executable), identity switch, no_new_privs, Landlock (ABI 6 required, `ResolveUnix` where ABI 9 exists), seccomp (deny list, io_uring off, socket families, netlink limits, TIOCSTI/TIOCLINUX), gamepad discovery. 13 unit tests + 26 escape tests (`tests/sandbox`).
+- Step 3: `app-objects` (fs-verity digests, object store; 3 unit + 9 kernel tests), `app-composefs` (reproducible images, verified mounts; 4 unit + 8 kernel tests).
+- Every protection was switched off once to confirm its tests fail.
+- Kernel tests run as root in the Lima VM (`tests/vm/lima-fedora.sh` recreates it; then `tests/vm/sandbox-tests.sh` and `tests/vm/storage-tests.sh`) and in CI under virtme-ng on x86_64, Linux 6.12 (job `kernel-tests`).
+
+**Next:** step 4 (registry + launcher), starting with how app accounts appear in the user database (systemd drop-in user records, or `/etc/passwd`; spec section 14). The ID range is decided (spec section 7): `0x70000000–0x7FFDFFFF`, blocks of 65536, block `0x7000` reserved for the runtime and tests.
+
+**Open items**
+- Portal feasibility spike after Milestone 1 (the owner is working out the fork).
+- How the portal's document store is made reachable by app accounts.
+- Controllers plugged in after launch (step 8): likely the launcher or a small shared service passes new devices as file descriptors, the way logind does for compositors. Not decided.
+- On systemd systems, create each app's cgroup through a systemd transient scope rather than directly under `/sys/fs/cgroup` (step 4).
+- PipeWire's access-control module, so apps connecting as their own account get playback only (step 8).
+- Ubuntu's AppArmor restriction on unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns`): the kernel check does not detect it yet, and browsers' inner sandboxes need user namespaces.
+- Real-hardware tests on the R36S (Landlock ABI, fs-verity on its filesystem, Panfrost, controllers).
+- A human security review of the launcher and installer before any public release.
+
 ## 1. What this project is
 
 `.app` is an open, OS-neutral app format for modern Linux: one sealed file per app, isolated by the kernel, with nothing running beside it. It aims for iOS-like simplicity and reliability ("tap install, it works, it keeps working") while staying open (any store, sideloading, open spec).
@@ -109,12 +130,6 @@ Work in this order. Finish and test each step before starting the next.
 8. `crates/desktop`, `data/` files, polkit, app bus + shared proxy, UnifiedPush distributor integration.
 9. Portal patch (separate fork repo).
 
-**Open items**
-
-- Step 4: on systemd systems, create the app's cgroup through a systemd transient scope rather than directly under `/sys/fs/cgroup`.
-- Step 8: PipeWire needs its access-control module (the one Flatpak uses with portals), so apps connecting as their own account get playback only.
-- Step 8: game controllers plugged in after an app starts are not visible to it (Landlock rules cannot grow after launch). Likely design: the launcher or a small shared service passes new controller devices to the app as file descriptors, the way logind hands devices to compositors. Not decided yet.
-
 ## 5. Technology choices
 
 - Rust stable, edition 2024. `cargo fmt`, `cargo clippy -- -D warnings` must pass.
@@ -150,7 +165,7 @@ The spec lets platforms choose paths. Use these defaults, all configurable:
 - Develop on an x86_64 Linux machine with kernel 6.12+ (current Fedora or Arch). The filesystem holding the object store must support fs-verity (ext4 with the `verity` feature enabled via `tune2fs -O verity`, or btrfs).
 - Needed packages: erofs-utils, composefs, fsverity-utils, patchelf, libseccomp, and for packager work flatpak.
 - Cross-compile for aarch64 with `cargo-zigbuild` or `cross`; test on the R36S.
-- Kernel-dependent tests run in a VM with `virtme-ng` locally and in CI (GitHub runners may have an older kernel).
+- Kernel-dependent tests run as root in a VM: on a Mac, `tests/vm/lima-fedora.sh` builds the pinned Fedora 44 VM (Lima); in CI, the `kernel-tests` job boots Linux 6.12 under `virtme-ng` (GitHub runners have an older kernel).
 - R36S kernel must have: Landlock (ABI 6), EROFS, overlayfs with verity, fs-verity, cgroup v2, seccomp. Verify this first.
 
 ## 8. Security coding rules

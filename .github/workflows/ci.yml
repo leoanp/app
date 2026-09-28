@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,6 +33,97 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # `+1.88` overrides rust-toolchain.toml, which asks for stable.
       - run: cargo +1.88 check --workspace --all-targets
-  # The sandbox escape tests need root and Linux 6.12+ (GitHub's runners are
-  # older), so they are ignored here and run by tests/vm/sandbox-tests.sh.
-  # A virtme-ng job will run them in CI later.
+
+  kernel-tests:
+    # The sandbox escape tests and the store/composefs tests need root, a
+    # Linux 6.12+ kernel and fs-verity. GitHub's runner kernels are older,
+    # so they run in a virtme-ng guest on Linux 6.12, the spec's minimum.
+    # (The ARM VM, tests/vm/lima-fedora.sh, covers a current kernel.)
+    name: kernel tests (x86_64, Linux ${{ matrix.kernel }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["6.12"]
+    env:
+      COMPOSEFS_VERSION: "1.0.8"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev qemu-system-x86 flex bison bc \
+            libelf-dev libssl-dev e2fsprogs meson ninja-build pkg-config jq python3-pip
+          pip3 install --user --break-system-packages virtme-ng==1.41
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Install composefs ${{ env.COMPOSEFS_VERSION }} (same version as the VM)
+        run: |
+          curl -fsSL "https://github.com/composefs/composefs/archive/refs/tags/v${COMPOSEFS_VERSION}.tar.gz" | tar xz
+          cd "composefs-${COMPOSEFS_VERSION}"
+          meson setup build --prefix=/usr -Dfuse=disabled -Dman=disabled
+          ninja -C build
+          sudo ninja -C build install
+          mkcomposefs --help | head -1
+          ls -l /usr/sbin/mount.composefs /usr/bin/mount.composefs 2>/dev/null || true
+      - name: Kernel cache
+        id: kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: kernel/bzImage
+          key: kernel-${{ matrix.kernel }}-${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: Build Linux ${{ matrix.kernel }}
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${{ matrix.kernel }}.tar.xz" | tar xJ
+          cd "linux-${{ matrix.kernel }}"
+          vng --kconfig \
+            --configitem CONFIG_SECURITY=y \
+            --configitem CONFIG_SECURITY_LANDLOCK=y \
+            --configitem CONFIG_SECCOMP=y \
+            --configitem CONFIG_SECCOMP_FILTER=y \
+            --configitem CONFIG_USER_NS=y \
+            --configitem CONFIG_CGROUPS=y \
+            --configitem CONFIG_FS_VERITY=y \
+            --configitem CONFIG_EXT4_FS=y \
+            --configitem CONFIG_EROFS_FS=y \
+            --configitem CONFIG_EROFS_FS_XATTR=y \
+            --configitem CONFIG_OVERLAY_FS=y \
+            --configitem CONFIG_BLK_DEV_LOOP=y \
+            --configitem CONFIG_TMPFS=y \
+            --configitem CONFIG_UNIX98_PTYS=y \
+            --configitem CONFIG_IO_URING=y \
+            --configitem CONFIG_KEYS=y \
+            --configitem CONFIG_BPF_SYSCALL=y \
+            --configitem CONFIG_PERF_EVENTS=y
+          make olddefconfig
+          for opt in SECURITY_LANDLOCK SECCOMP_FILTER USER_NS FS_VERITY EROFS_FS EROFS_FS_XATTR OVERLAY_FS BLK_DEV_LOOP; do
+            grep -q "^CONFIG_${opt}=y" .config || { echo "CONFIG_${opt} is not set" >&2; exit 1; }
+          done
+          make -j"$(nproc)" bzImage
+          mkdir -p ../kernel && cp arch/x86/boot/bzImage ../kernel/bzImage
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the test programs
+        run: |
+          {
+            cargo test -p sandbox-tests --test escape --no-run --message-format=json
+            cargo test -p app-objects --lib --no-run --message-format=json
+            cargo test -p app-composefs --no-run --message-format=json
+          } | jq -r 'select(.profile.test == true and .executable != null) | .executable' > test-programs.txt
+          cat test-programs.txt
+          test "$(wc -l < test-programs.txt)" -ge 4
+      - name: Run the kernel tests in the guest
+        run: |
+          mkdir -p "$RUNNER_TEMP/guest"
+          vng --run kernel/bzImage --user root --memory 4G --cpus 2 \
+            --append lsm=landlock,yama \
+            --rwdir "/var/lib/appci=$RUNNER_TEMP/guest" \
+            --exec "tests/vm/ci-guest.sh /var/lib/appci $(tr '\n' ' ' < test-programs.txt)" 2>&1 | tee guest.log
+          grep -q "^test result: ok" guest.log
+          ! grep -q "test result: FAILED" guest.log
