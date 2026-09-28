@@ -8,6 +8,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+png = "0.18.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_ignored = "0.1.14"
+spdx = "0.13.5"
+thiserror = "2.0.21"
+toml = "1.1.6"
+url = "2.5.8"
 
 [lints]
 workspace = true

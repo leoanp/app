@@ -69,7 +69,8 @@ Architecture at a glance:
 └──────────────┘     └──────────────┘     └──────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────────┐
 │ Platform foundation: kept up to date, never breaks old apps      │
-│ glibc, libstdc++, Mesa, Vulkan, libva, Wayland/PipeWire clients  │
+│ glibc, libstdc++, Mesa, Vulkan, libglvnd (GL/GLX/EGL), libva,    │
+│ driver-linked X11 client libs, Wayland/PipeWire clients          │
 ├──────────────────────────────────────────────────────────────────┤
 │ Linux kernel: EROFS, composefs, fs-verity, Landlock, seccomp,    │
 │ per-app user IDs, cgroups                                        │
@@ -93,7 +94,7 @@ Each app is sealed, runs as its own user, and reaches the display, sound and the
 
 The foundation is the only code an app may borrow from the platform; everything else must be inside the bundle. A library belongs in the foundation only if both of these hold:
 
-1. It must come from the platform, because it loads hardware drivers, talks to a platform service, or is the C or C++ runtime those drivers are built against.
+1. It must come from the platform, because it loads hardware drivers, talks to a platform service, or is a library the platform's drivers are built against (such as the C and C++ runtimes).
 2. Its developers keep a documented promise not to break programs built against older versions.
 
 Popularity is never a reason. The foundation is what any modern, standard Linux system already provides.
@@ -105,21 +106,29 @@ Popularity is never a reason. The foundation is what any modern, standard Linux 
 | Linux kernel system calls | The kernel never breaks existing programs | not declared |
 | glibc (C library and dynamic loader) | Platform drivers loaded into apps are built against it | `requires.glibc` |
 | libstdc++, libgcc_s | C++ runtime of platform drivers such as Mesa | `requires.libstdcxx` |
-| Vulkan loader, EGL/OpenGL/OpenGL ES (libglvnd), Mesa drivers, libdrm, libgbm | GPU drivers must match the hardware and kernel | `requires.vulkan`, `requires.gles` |
+| Vulkan loader, libglvnd (`libGL.so.1`, `libGLX.so.0`, `libOpenGL.so.0`, EGL, OpenGL ES), Mesa drivers, libdrm, libgbm | GPU drivers must match the hardware and kernel | `requires.vulkan`, `requires.gl`, `requires.gles` |
+| A fixed set of X11 client libraries GPU drivers are built against (libX11, libxcb and related; listed below) | Mesa's GLX driver, and its EGL driver when built with X11 support, are built against them; their interfaces have been stable for decades | not declared; always present |
 | libva and its drivers | Hardware video decoding and encoding drivers | `requires.libva` |
 | Wayland client libraries, libxkbcommon | Talk to the platform's compositor | not declared; always present |
 | PipeWire client library, ALSA library routed to PipeWire | Talk to the platform's audio server | not declared; always present |
 
+**The X11 set** is fixed by this spec, so a bundle works the same on every platform: libX11, libX11-xcb, libxcb with its `glx`, `dri2`, `dri3`, `present`, `sync`, `xfixes`, `randr` and `shm` extensions, libXext, libXfixes, libXxf86vm, libxshmfence, libXau and libXdmcp. Every platform installs all of them, even if its own drivers use fewer. Platforms also build their OpenGL stack with GLX support (Mesa's GLX driver present), even on systems without an X11 desktop: the foundation promises `libGL.so.1` and `libGLX.so.0`, and X11 apps using OpenGL need a GLX driver behind them.
+
+**Driver-internal libraries** (Mesa's driver files, the GPU-specific libdrm helpers such as `libdrm_amdgpu`, libglvnd's vendor libraries, libva and Vulkan drivers) belong to the foundation too. Bundles never contain them, but which ones a platform installs depends on its hardware.
+
+**The foundation list.** The exact library list of each format version is published with this spec as a machine-readable file, `foundation.toml`. Tools use it to decide what a bundle must not contain.
+
 **System data apps may read** (files, not libraries): installed fonts and font configuration, icon and cursor themes, trusted certificate authorities, time zone data, DNS and host name configuration, and locale settings.
 
-**Always bundled, never foundation:** everything else, including SDL2, zlib, fontconfig, FreeType, HarfBuzz, libudev, OpenSSL, FFmpeg, ICU, Qt, GTK, Python, X11 client libraries and Xwayland. composefs stores identical copies once, so bundling costs no extra disk space for files shared between apps.
+**Always bundled, never foundation:** everything else, including SDL2, zlib, fontconfig, FreeType, HarfBuzz, libudev, OpenSSL, FFmpeg, ICU, Qt, GTK, Python, X11 libraries not listed above (such as libXrandr, libXi, libXcursor) and Xwayland. composefs stores identical copies once, so bundling costs no extra disk space for files shared between apps. Wayland apps never load the foundation's X11 libraries; only apps that use GLX or X11 do.
 
 **Rules for platforms**
 
 1. Foundation versions only move forward. An update never removes anything an app could be using.
 2. If a foundation library releases an incompatible new major version, the new one is added beside the old one; the old one stays.
-3. The platform publishes the foundation versions of each of its releases, so tools and stores can check bundles against them.
-4. The runtime checks an app's `requires` at every launch, not only at install. After a system rollback, an app needing newer versions shows "Update your system to open this app" instead of starting.
+3. Each platform release carries its own foundation list, generated from its build: the spec's `foundation.toml` with any libraries the platform adds (it may add, never drop), plus a `[provides]` table giving the version of each requirement it meets, for example `glibc = "2.40"`. `glibc` and `libstdcxx` are always given; a graphics or video entry is left out on hardware without it, and apps requiring it do not run there. The list lives in the read-only system image, so after a rollback it describes the system that is actually running.
+4. The platform also publishes that same file for each release, for example alongside its release notes. Stores and tools use these published copies, since they cannot read a device. The store client on the device makes the final compatibility check with the local file.
+5. The runtime checks an app's `requires` against the local file at every launch, not only at install. After a system rollback, an app needing newer versions shows "Update your system to open this app" instead of starting.
 
 **Processor architecture.** Each bundle is built for one architecture (`x86_64` or `aarch64`). The store serves the right file for each device. This keeps downloads small; one file per architecture is simpler than a combined file.
 
@@ -143,12 +152,13 @@ RetroArch.app
 
 **Rules for bundles**
 
-1. `manifest.toml` and `icons/256.png` must be at the top level.
+1. `manifest.toml` and `icons/256.png` must be at the top level. `icons/256.png` must be a valid PNG of exactly 256×256 pixels; `icons/scalable.svg`, if present, is at most 1 MiB.
 2. Programs must find bundled libraries through a relative search path (`$ORIGIN/../lib`) and must not depend on an absolute install location.
 3. A bundle must not contain foundation libraries (section 4).
 4. Special files are not allowed: the installer rejects device files and removes setuid and setgid flags.
 5. An app that needs X11 bundles its own Xwayland and a small X11-to-Wayland bridge (such as xwayland-satellite), started by its own `exec`. The runtime treats it like any other app; each X11 app gets a private X server inside its own sandbox, so X11 apps cannot see each other.
 6. Apps that were built to live at `/app` (converted from Flatpak) set `compat.prefix = "/app"`. The launcher then shows the app's files at `/app` inside that app's private view of the filesystem.
+7. Symbolic links must be relative and, followed through the bundle's own files, must never lead outside it. A link to a missing file is allowed, as long as the part that exists stays inside.
 
 **Storage on the device**
 
@@ -163,11 +173,13 @@ The platform chooses where the object store and mount points live. The spec requ
 
 **External files.** A bundle may declare files that are not inside it, but downloaded by each device directly from their publisher at install time. This is how proprietary apps are distributed without any store hosting them, the same approach as Flathub's extra-data. For each external file, the manifest gives the publisher's download address, size, SHA-256 hash, where it goes inside the app, and optionally how to unpack it (`tar`, `zip` or `deb`). The installer downloads it from that address, checks size and hash against the store's signed metadata, unpacks it, and stores the result through composefs like any other app file. Because the final file tree depends on the download, the installer generates the composefs image itself for these apps. If the publisher's file no longer matches its hash, the install stops with a clear message until the store updates the entry. Stores never host external files.
 
+Unpacking is strict. For `deb`, only the package's data archive is extracted; its maintainer scripts and control files are never run or used. For every format, the installer refuses entries that would land outside `dest`, absolute paths, device files, and hard links pointing outside the extracted files, and removes setuid and setgid flags. The unpacked files then follow the same rules as the rest of the bundle.
+
 **File type registration.** Platforms register `.app` in the freedesktop shared-mime-info database, matched by both the `.app` extension and the EROFS signature at byte offset 1024, so every desktop recognizes a bundle by its contents and opens it with the installer.
 
 ## 6. Manifest
 
-Every bundle carries `manifest.toml`, a TOML file stating what the app is, what it needs, and which install-time permissions it requests. Permissions requested at run time through the portal (camera, microphone, location, file picking) are never declared. Unknown fields are ignored, so newer bundles still install on older platforms whenever `format` allows it.
+Every bundle carries `manifest.toml`, a TOML file stating what the app is, what it needs, and which install-time permissions it requests. Permissions requested at run time through the portal (camera, microphone, location, file picking) are never declared. Unknown fields are ignored, so newer bundles still install on older platforms whenever `format` allows it; the exact rules are under **Validation** below.
 
 **Example**
 
@@ -220,14 +232,14 @@ inputs = ["gamepad", "touch", "pointer"]
 | `app.categories` | no | list | Freedesktop menu categories. |
 | `requires.glibc` | yes | version | Lowest glibc the app runs on. Filled in automatically by `app build`. |
 | `requires.libstdcxx` | no | version | Lowest libstdc++ symbol version, for C++ apps. Filled in automatically. |
-| `requires.vulkan`, `requires.gles`, `requires.libva` | no | version | Lowest graphics or video API version needed. |
+| `requires.vulkan`, `requires.gl`, `requires.gles`, `requires.libva` | no | version | Lowest Vulkan, desktop OpenGL, OpenGL ES or VA-API version needed. |
 | `permissions.network` | no | boolean | Internet and local network access. |
 | `permissions.audio` | no | boolean | Sound playback. |
 | `permissions.gamepad` | no | boolean | Game controllers. |
 | `permissions.folders.<name>` | no | `{ access, reason? }` | A shared user folder (section 8); `access` is `read` or `read-write`. |
 | `permissions.removable` | no | `{ access, reason? }` | SD cards and USB drives. |
 | `permissions.background` | no | boolean | Asks to keep running when not visible. The platform decides whether to honor it. |
-| `reasons.<permission>` | no | string | Optional text shown in a prompt, for example `reasons.camera`. Never required. |
+| `reasons.<permission>` | no | string | Optional text shown in a prompt, for example `reasons.camera`. Never required. Keys: `network`, `audio`, `gamepad`, `removable`, `background`, `printing`, `ssh_agent`, `services`, and the run-time permissions `camera`, `microphone`, `location`, `notifications`, `screen_sharing`, `global_shortcuts`, `usb`, `autostart`. |
 | `ui.inputs` | yes | list: `gamepad`, `touch`, `pointer`, `keyboard`, `remote` | Input methods the app can be fully used with. Stores hide apps a device cannot operate. |
 | `ui.min_width` | no | integer (pixels) | Smallest usable window width. |
 | `integration.mime_types` | no | list | File types the app opens, registered with the desktop. |
@@ -248,7 +260,57 @@ dest = "vendor/"
 unpack = "tar"
 ```
 
-**Validation.** A platform must refuse a bundle whose manifest lacks a required field, names an unknown `format`, requests an unknown permission value, or points `exec` at a file that does not exist.
+**Validation.** Every platform must accept and refuse exactly the same manifests, so a bundle behaves the same everywhere. A platform must refuse a bundle that breaks any rule below. Refusals because of `format` or `[requires]` are shown as "Needs a newer system version"; the others as a broken bundle. Rules marked *warning* never refuse; `app check` reports them.
+
+*General*
+
+- `manifest.toml` is valid TOML, UTF-8, at most 64 KiB.
+- No string contains a NUL character.
+- Unless a rule below says otherwise, strings are at most 1024 bytes and lists at most 64 entries. This applies to unknown fields too.
+- Every required field is present, and every field has the type the field reference gives.
+
+*Unknown keys and values*
+
+- `format` must be `1`. It is checked first, since a newer format may change any other rule.
+- An unknown key in `[requires]` is refused: a platform that cannot check a requirement must not install the app.
+- Anywhere else, an unknown key is ignored (*warning*). An unknown key in `[permissions]` is never granted.
+- A known field with an unknown value is refused: `app.arch`, a folder name other than the six in section 8, `access`, `unpack`, `compat.prefix`.
+- `ui.inputs` entries this format does not know are ignored (*warning*), but at least one known entry is required.
+- `app.categories` entries that are not registered Freedesktop categories are ignored (*warning*).
+- `reasons.<permission>` keys that are not in the field reference are ignored (*warning*).
+
+*Identity and versions*
+
+- `app.id` follows Flatpak's rules, so converted apps keep their IDs: at least 3 dot-separated parts of letters, digits, `_` and `-`; `-` only in the last part; no part empty or starting with a digit; at most 255 bytes.
+- `app.name` and `app.version`: 1–64 characters. `app.summary`: at most 200 characters. None of them contain control characters such as line breaks. `app.version` is only shown, never compared.
+- `app.build`: a whole number from 1 to 2⁶³−1.
+- Versions in `[requires]`: 1–4 dot-separated whole numbers without leading zeros (`"2.39"`, `"3.4.30"`). They compare part by part, and missing parts count as 0, so `2.39` equals `2.39.0`.
+- `app.license`: a valid SPDX expression. Deprecated SPDX identifiers are accepted.
+- `app.source`: required unless every license in the expression is a custom `LicenseRef-…` identifier, which marks a proprietary app.
+- `app.source` and `app.homepage`: `https://` or `http://` URLs with a host.
+
+*Paths*
+
+- `app.exec` and `external.dest`: relative, `/`-separated, at most 4096 bytes, with no empty, `.` or `..` parts. `dest` may end with `/`.
+- `app.exec` must lead, following symbolic links only inside the bundle, to a regular file marked executable. If it lies inside an external file's `dest`, this is checked after the download.
+- `compat.prefix`: exactly `/app`.
+- `app.args`: at most 256 entries of at most 4096 bytes each.
+
+*Permissions*
+
+- `permissions.network`, `audio`, `gamepad`, `background`, `printing` and `ssh_agent` are booleans.
+- `permissions.folders.<name>` and `permissions.removable`: `access` is `read` or `read-write`; `reason`, like every `reasons.<permission>` text, is 1–500 characters without control characters.
+- `permissions.services`: D-Bus well-known names (at least 2 dot-separated parts of letters, digits, `_` and `-`, no part starting with a digit, at most 255 bytes), with no wildcards. Names the app bus already provides are refused: `org.freedesktop.DBus`, `org.freedesktop.portal.*` and `org.freedesktop.impl.portal.*`.
+
+*External files*
+
+- `url`: `https://` only. `sha256`: exactly 64 lowercase hexadecimal characters. `size`: from 1 byte to 64 GiB. `unpack`: `tar` (compression detected automatically), `zip` or `deb`.
+
+*Integration, interface and environment*
+
+- `integration.mime_types`: `type/subtype`, at most 256 entries. `integration.url_schemes`: lowercase URL schemes; `file` is refused.
+- `ui.min_width`: 1–16384.
+- `compat.env`: names are letters, digits and `_`, not starting with a digit. Every variable the launcher sets or controls is refused: names starting with `LD_`, `XDG_`, `DBUS_`, `WAYLAND_`, `PIPEWIRE_` or `AT_SPI_`, and `HOME`, `TMPDIR`, `PATH`, `USER`, `LOGNAME`, `SHELL`, `GDK_BACKEND`, `QT_QPA_PLATFORM`, `SDL_VIDEODRIVER`, `GTK_USE_PORTAL`, `QT_QPA_PLATFORMTHEME`, `SECRET_BACKEND`, `SSH_AUTH_SOCK`, `DISPLAY`, `NOTIFY_SOCKET` and `LISTEN_FDS`. Implementations keep this as one list shared by their launcher and validator.
 
 ## 7. Security model
 
@@ -345,7 +407,7 @@ Nothing else on the session bus is reachable. The portal is connected to both bu
 
 **Picked files and folders.** Files and folders the user picks in the portal's dialog reach the app through the portal's document store, the same shared service Flatpak uses, which gives that app access to what was picked and nothing else. Access to a picked folder is remembered, so the app keeps it after restarting.
 
-**Extra desktop services.** A few apps need a specific desktop service beyond the standard ones above, for example KDE Connect. They list its D-Bus name in `permissions.services`; the user sees it at install and can revoke it. Such an app gets its own instance of the filtering proxy, allowing only its listed services, exactly as Flatpak does. It is the only case where anything runs beside an app, and only for apps that ask.
+**Extra desktop services.** A few apps need a specific desktop service beyond the standard ones above, for example KDE Connect. They list its D-Bus name in `permissions.services`; the user sees it at install and can revoke it. Such an app gets its own instance of the filtering proxy, allowing only its listed services, exactly as Flatpak does. It is the only case where anything runs beside an app, and only for apps that ask. The proxy refuses any service that would let an app escape its sandbox or read other apps' secrets, such as keyrings, systemd, polkit, Flatpak's own services and `org.freedesktop.impl.portal.*`, even if the user allows it.
 
 ## 9. App data
 
@@ -478,7 +540,7 @@ Existing tools it builds on: `mkfs.erofs` and `mkcomposefs` for images, `fsverit
 
 **Converting Flathub apps.** A Flathub app depends on a separate runtime, so it cannot simply be copied. Two routes:
 
-- **Merge:** take the app plus the runtime libraries it uses, drop the runtime's foundation libraries, and set `compat.prefix = "/app"`. Fast; works for most apps.
+- **Merge:** take the app plus the runtime libraries it uses, drop the runtime's foundation libraries, and set `compat.prefix = "/app"`. Symbolic links pointing into `/app/...` are rewritten as relative links, since bundles only allow those (section 5). Fast; works for most apps.
 - **Rebuild:** compile the app from its public Flathub recipe against the foundation. Smaller, cleaner bundles; the long-term route.
 
 **Permissions from Flathub recipes.** `app convert` reads each app's declared Flathub permissions and translates them:
