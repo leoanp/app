@@ -1,0 +1,234 @@
+//! The shared object store (spec section 5, "Storage on the device", steps
+//! 2, 3 and 6): every file stored once, named by its fs-verity digest,
+//! with fs-verity enabled so the kernel checks it on every read.
+//!
+//! Layout (composefs): `<root>/objects/ab/cdef…`, plus `<root>/tmp/` for
+//! imports in progress. The root is closed to everyone but its owner
+//! (root): apps read their files only through their composefs mounts.
+
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use composefs_ioctls::fsverity::{EnableVerityError, fs_ioc_enable_verity, fs_ioc_measure_verity};
+
+use crate::digest::{self, BLOCK_SIZE, Digest};
+
+const SHA256: u8 = 1;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{context}: {source}")]
+    Io { context: String, source: io::Error },
+    #[error("the filesystem holding {0} does not support fs-verity")]
+    VerityUnsupported(PathBuf),
+    #[error("fs-verity failed on {path}: {message}")]
+    Verity { path: PathBuf, message: String },
+    #[error("stored data does not match: computed {computed}, kernel measured {measured}")]
+    Mismatch { computed: Digest, measured: Digest },
+}
+
+fn io_err(context: impl std::fmt::Display) -> impl FnOnce(io::Error) -> Error {
+    move |source| Error::Io {
+        context: context.to_string(),
+        source,
+    }
+}
+
+/// A content-addressed store of fs-verity-protected files.
+#[derive(Clone, Debug)]
+pub struct Store {
+    root: PathBuf,
+}
+
+impl Store {
+    /// Opens the store at `root`, creating it (mode 0700) if needed.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Store, Error> {
+        let root = root.into();
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        for dir in [root.clone(), root.join("objects"), root.join("tmp")] {
+            builder.create(&dir).map_err(io_err(dir.display()))?;
+        }
+        Ok(Store { root })
+    }
+
+    /// The folder composefs mounts use as their `basedir`.
+    pub fn objects_dir(&self) -> PathBuf {
+        self.root.join("objects")
+    }
+
+    /// Where the object with this digest lives.
+    pub fn path(&self, d: &Digest) -> PathBuf {
+        self.objects_dir().join(d.object_path())
+    }
+
+    /// Fails unless the store's filesystem can enable fs-verity. The
+    /// runtime refuses to install or run apps otherwise (fail closed).
+    pub fn check_verity_support(&self) -> Result<(), Error> {
+        let tmp = self.root.join("tmp");
+        let mut f = tempfile::NamedTempFile::new_in(&tmp).map_err(io_err(tmp.display()))?;
+        f.write_all(b"verity probe").map_err(io_err("probe"))?;
+        let path = f.into_temp_path();
+        let file = File::open(&path).map_err(io_err("probe"))?;
+        match fs_ioc_enable_verity(&file, SHA256, BLOCK_SIZE as u32) {
+            Ok(()) => Ok(()),
+            Err(EnableVerityError::FilesystemNotSupported) => {
+                Err(Error::VerityUnsupported(self.root.clone()))
+            }
+            Err(e) => Err(Error::Verity {
+                path: self.root.clone(),
+                message: e.to_string(),
+            }),
+        }
+    }
+
+    /// Copies a file into the store and returns its digest. A file already
+    /// stored (by any app) is not stored again.
+    pub fn import_file(&self, src: &Path) -> Result<Digest, Error> {
+        let f = File::open(src).map_err(io_err(src.display()))?;
+        self.import(f)
+    }
+
+    /// Stores everything `reader` yields and returns its digest.
+    pub fn import(&self, reader: impl Read) -> Result<Digest, Error> {
+        let tmp_dir = self.root.join("tmp");
+        let mut tmp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o644))
+            .tempfile_in(&tmp_dir)
+            .map_err(io_err(tmp_dir.display()))?;
+        // One pass: hash while copying.
+        let computed = digest::compute(Tee {
+            inner: reader,
+            copy: tmp.as_file_mut(),
+        })
+        .map_err(io_err("copying into the store"))?;
+        tmp.as_file().sync_all().map_err(io_err("syncing"))?;
+
+        if self.verify(&computed)? {
+            return Ok(computed); // already stored and intact
+        }
+        // fs-verity needs the file closed for writing.
+        let tmp_path = tmp.into_temp_path();
+        let file = File::open(&tmp_path).map_err(io_err("reopening"))?;
+        match fs_ioc_enable_verity(&file, SHA256, BLOCK_SIZE as u32) {
+            Ok(()) => {}
+            Err(EnableVerityError::FilesystemNotSupported) => {
+                return Err(Error::VerityUnsupported(self.root.clone()));
+            }
+            Err(e) => {
+                return Err(Error::Verity {
+                    path: tmp_path.to_path_buf(),
+                    message: e.to_string(),
+                });
+            }
+        }
+        let measured = measure(&file, &tmp_path)?;
+        if measured != computed {
+            return Err(Error::Mismatch { computed, measured });
+        }
+        let dest = self.path(&computed);
+        if let Some(parent) = dest.parent() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(io_err(parent.display()))?;
+        }
+        // Atomic; replaces a damaged copy if one was there.
+        tmp_path.persist(&dest).map_err(|e| Error::Io {
+            context: dest.display().to_string(),
+            source: e.error,
+        })?;
+        Ok(computed)
+    }
+
+    /// Whether the object is present, has fs-verity enabled, and the kernel
+    /// measures exactly this digest.
+    pub fn verify(&self, d: &Digest) -> Result<bool, Error> {
+        let path = self.path(d);
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(Error::Io {
+                    context: path.display().to_string(),
+                    source: e,
+                });
+            }
+        };
+        Ok(fs_ioc_measure_verity::<32>(&file, SHA256).is_ok_and(|m| Digest(m) == *d))
+    }
+
+    /// Deletes every object not in `keep`, and leftovers of interrupted
+    /// imports. Returns how many objects were deleted.
+    pub fn gc(&self, keep: &BTreeSet<Digest>) -> Result<u64, Error> {
+        let mut removed = 0;
+        let objects = self.objects_dir();
+        for prefix in fs::read_dir(&objects).map_err(io_err(objects.display()))? {
+            let prefix = prefix.map_err(io_err(objects.display()))?;
+            let prefix_name = prefix.file_name().to_string_lossy().into_owned();
+            for obj in fs::read_dir(prefix.path()).map_err(io_err(prefix.path().display()))? {
+                let obj = obj.map_err(io_err(prefix.path().display()))?;
+                let name = format!("{prefix_name}{}", obj.file_name().to_string_lossy());
+                let wanted = name.parse::<Digest>().is_ok_and(|d| keep.contains(&d));
+                if !wanted {
+                    fs::remove_file(obj.path()).map_err(io_err(obj.path().display()))?;
+                    removed += 1;
+                }
+            }
+            // Empty prefix folders go too; a non-empty one simply stays.
+            let _ = fs::remove_dir(prefix.path());
+        }
+        let tmp = self.root.join("tmp");
+        for entry in fs::read_dir(&tmp).map_err(io_err(tmp.display()))?.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+        Ok(removed)
+    }
+}
+
+/// Asks the kernel for a file's fs-verity digest.
+pub fn measure(file: &File, path: &Path) -> Result<Digest, Error> {
+    fs_ioc_measure_verity::<32>(file, SHA256)
+        .map(Digest)
+        .map_err(|e| Error::Verity {
+            path: path.to_owned(),
+            message: e.to_string(),
+        })
+}
+
+/// Enables fs-verity on a finished file (such as a composefs image) and
+/// returns the kernel's digest. The file must not be open for writing.
+pub fn seal(path: &Path) -> Result<Digest, Error> {
+    let file = File::open(path).map_err(io_err(path.display()))?;
+    match fs_ioc_enable_verity(&file, SHA256, BLOCK_SIZE as u32) {
+        Ok(()) | Err(EnableVerityError::AlreadyEnabled) => {}
+        Err(EnableVerityError::FilesystemNotSupported) => {
+            return Err(Error::VerityUnsupported(path.to_owned()));
+        }
+        Err(e) => {
+            return Err(Error::Verity {
+                path: path.to_owned(),
+                message: e.to_string(),
+            });
+        }
+    }
+    measure(&file, path)
+}
+
+/// A reader that writes everything it reads to `copy`.
+struct Tee<'a, R> {
+    inner: R,
+    copy: &'a mut File,
+}
+
+impl<R: Read> Read for Tee<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.copy.write_all(&buf[..n])?;
+        Ok(n)
+    }
+}

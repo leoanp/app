@@ -9,7 +9,12 @@ cd "$(dirname "$0")/../.."
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/target}"
 
 cargo test -q -p app-sandbox
+# Pick the test program itself (target kind "test"), not the helper binaries
+# built alongside it.
 bin=$(cargo test -p sandbox-tests --test escape --no-run --message-format=json 2>/dev/null |
-    sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)
-[ -n "$bin" ] || { echo "could not build the escape tests" >&2; exit 1; }
+    grep '"kind":\["test"\]' | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p')
+case "$bin" in
+    */deps/escape-*) ;;
+    *) echo "could not find the escape test program (got: '$bin')" >&2; exit 1 ;;
+esac
 sudo "$bin" --include-ignored --test-threads=1 "$@"
