@@ -1,0 +1,13 @@
+[package]
+name = "app-store-client"
+description = "TUF metadata, downloads, external files and revocation (spec section 11)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/leoanp/app"
+publish = false
+
+[workspace.dependencies]
+# Internal crates. Package names carry an `app-` prefix so they never clash
+# with crates.io names (e.g. `composefs` from composefs-rs).
+app-manifest = { path = "crates/manifest" }
+app-foundation = { path = "crates/foundation" }
+app-objects = { path = "crates/objects" }
+app-composefs = { path = "crates/composefs" }
+app-registry = { path = "crates/registry" }
+app-sandbox = { path = "crates/sandbox" }
+app-connections = { path = "crates/connections" }
+app-store-client = { path = "crates/store-client" }
+app-desktop = { path = "crates/desktop" }
+app-packager = { path = "crates/pack" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

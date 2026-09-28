@@ -1,0 +1,13 @@
+[package]
+name = "app-desktop"
+description = "Desktop entries, icons, MIME type and URL scheme registration (spec section 10)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "app-packager"
+description = "Packager: ELF dependencies, glibc version detection, convert, permission mapping, image building, signing (spec section 12)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

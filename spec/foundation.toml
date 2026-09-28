@@ -1,0 +1,33 @@
+# Foundation libraries, format version 1 (spec section 4).
+# Machine-readable mirror of the spec's foundation table.
+# Sonames are filled in and tested in build step 1 (crates/foundation).
+
+format = 1
+
+[[component]]
+name = "glibc"
+requires_key = "glibc"
+sonames = []
+
+[[component]]
+name = "libstdc++ / libgcc_s"
+requires_key = "libstdcxx"
+sonames = []
+
+[[component]]
+name = "graphics (Vulkan loader, libglvnd EGL/GL/GLES, Mesa, libdrm, libgbm)"
+requires_key = ["vulkan", "gles"]
+sonames = []
+
+[[component]]
+name = "libva"
+requires_key = "libva"
+sonames = []
+
+[[component]]
+name = "Wayland client libraries, libxkbcommon"
+sonames = []
+
+[[component]]
+name = "PipeWire client, ALSA"
+sonames = []

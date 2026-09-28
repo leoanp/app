@@ -1,0 +1,13 @@
+[package]
+name = "app-sandbox"
+description = "Apply cgroup, uid/gid switch, no_new_privs, Landlock and seccomp before exec (spec section 7)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

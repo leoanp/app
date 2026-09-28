@@ -1,0 +1,13 @@
+[package]
+name = "app-connections"
+description = "Hand-in connections: Wayland security context, PipeWire, app bus, accessibility bus (spec sections 7, 8)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
